@@ -26,8 +26,7 @@ const dbClient = new Client({
 
 // Redis Configuration for Caching
 const redisClient = Redis.createClient({
-    host: process.env.REDIS_HOST || 'localhost',
-    port: process.env.REDIS_PORT || 6379
+    url: process.env.REDIS_PRIVATE_URL || process.env.REDIS_URL || 'redis://localhost:6379'
 });
 
 // Initialize Database Connection
