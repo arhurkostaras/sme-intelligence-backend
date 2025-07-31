@@ -428,17 +428,18 @@ async function startServer() {
     await initializeDatabase();
     await redisClient.connect();
     
-    // Initial data collection
-    console.log('🔄 Running initial data collection...');
-    await dataOrchestrator.collectAllData();
-    
+    // Start HTTP server FIRST
     app.listen(PORT, () => {
         console.log(`🚀 Real-Time SME Intelligence Server running on port ${PORT}`);
         console.log(`📊 API endpoints:`);
-        console.log(`   GET  /api/market-intelligence - Latest market data`);
-        console.log(`   POST /api/sme-submission - Submit SME data`);
-        console.log(`   GET  /api/analytics - Real-time analytics`);
+        console.log(`   GET  /api/market-intelligence`);
+        console.log(`   POST /api/sme-submission`);
+        console.log(`   GET  /api/analytics`);
     });
+    
+    // Then do data collection in background
+    console.log('🔄 Running initial data collection...');
+    dataOrchestrator.collectAllData().catch(console.error);  // Don't wait for it
 }
 
 startServer().catch(console.error);
