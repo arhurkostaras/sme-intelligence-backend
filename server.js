@@ -275,19 +275,17 @@ class DataCollectionOrchestrator {
                 isedSME,
                 cwBankData,
                 robertHalfData
-            const [
-    statCanAccounting,
-    statCanTech, 
-    isedSME,
-    cwBankData,
-    robertHalfData
-] = await Promise.all([
-                this.statCanAPI.getAccountingServicesPriceIndex(),
-                this.statCanAPI.getAdvancedTechnologySurvey(),
-                this.isedAPI.getSMEInnovationData(),
-                this.industryScraper.getCWBankResearch(),
-                this.industryScraper.getRobertHalfSalaryData()
-            ]);
+            // Collect from all sources simultaneously
+const results = await Promise.all([
+    this.statCanAPI.getAccountingServicesPriceIndex(),
+    this.statCanAPI.getAdvancedTechnologySurvey(),
+    this.isedAPI.getSMEInnovationData(),
+    this.industryScraper.getCWBankResearch(),
+    this.industryScraper.getRobertHalfSalaryData()
+]);
+
+// Assign results to named variables
+const [statCanAccounting, statCanTech, isedSME, cwBankData, robertHalfData] = results;
 
             // Store data in database
             // Debug: Log what data we actually collected
