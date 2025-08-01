@@ -425,8 +425,11 @@ cron.schedule('0 6 * * *', async () => {
 
 // 🚀 START SERVER
 async function startServer() {
-    await initializeDatabase();
-    await redisClient.connect();
+   // TEMPORARILY DISABLE DATABASE CONNECTIONS
+// await initializeDatabase();
+// await redisClient.connect();
+
+console.log('🚀 Starting server without databases (temporary)...');
     
     // Start HTTP server FIRST
     app.listen(PORT, () => {
