@@ -434,7 +434,6 @@ app.get('/', (req, res) => {
         timestamp: new Date().toISOString()
     });
 });
-});
 
 // Debug endpoint to check database data
 app.get('/api/debug/check-data', async (req, res) => {
