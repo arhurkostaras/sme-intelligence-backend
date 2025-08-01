@@ -277,9 +277,8 @@ class DataCollectionOrchestrator {
                 robertHalfData
            // Collect from all sources simultaneously  
 // Collect from all sources simultaneously  
-let allData = [];
 try {
-    const results = await Promise.all([
+    var results = await Promise.all([
         this.statCanAPI.getAccountingServicesPriceIndex(),
         this.statCanAPI.getAdvancedTechnologySurvey(), 
         this.isedAPI.getSMEInnovationData(),
@@ -287,14 +286,18 @@ try {
         this.industryScraper.getRobertHalfSalaryData()
     ]);
     
-    // Combine all results into one array
-    for (let i = 0; i < results.length; i++) {
+    var allData = [];
+    for (var i = 0; i < results.length; i++) {
         if (results[i] && Array.isArray(results[i])) {
             allData = allData.concat(results[i]);
         }
     }
+    
+    // Store data in database
+    await this.storeMarketData(allData);
 } catch (error) {
     console.error('Data collection error:', error);
+}
 }
 
 // Store data in database
