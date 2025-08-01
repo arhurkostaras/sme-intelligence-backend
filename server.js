@@ -145,7 +145,7 @@ app.get('/', (req, res) => {
 });
 
 // 🚀 START SERVER
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Canadian SME Intelligence Server running on port ${PORT}`);
     console.log(`📊 API endpoints available:`);
     console.log(`   GET  /api/test`);
