@@ -293,15 +293,7 @@ await this.storeMarketData([
     ...(dataCollection[4] || [])   // robertHalfData
 ]);
 
-            // Store data in database
-            // Debug: Log what data we actually collected
-console.log('📊 Data collected:', { 
-    statCanAccounting: statCanAccounting?.length || 0,
-    statCanTech: statCanTech?.length || 0, 
-    isedSME: isedSME?.length || 0,
-    cwBankData: cwBankData?.length || 0,
-    robertHalfData: robertHalfData?.length || 0
-});
+           
 
 await this.storeMarketData([
     ...(statCanAccounting || []),
