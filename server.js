@@ -358,20 +358,7 @@ app.get('/api/market-intelligence', async (req, res) => {
 });
         }
 
-        // Fallback to database
-        const result = await dbClient.query(
-            'SELECT * FROM market_data WHERE is_current = true ORDER BY collection_date DESC'
-        );
-
-        res.json({
-            status: 'success',
-            data: result.rows,
-            cached: false,
-            timestamp: new Date()
-        });
-    } catch (error) {
-        res.status(500).json({ status: 'error', message: error.message });
-    }
+       
 });
 
 // Submit SME data from your forms
