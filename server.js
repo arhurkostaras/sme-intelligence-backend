@@ -327,6 +327,16 @@ class DataCollectionOrchestrator {
         await redisClient.setex('latest_market_data', 3600, JSON.stringify(recentData.rows));
     }
 }
+// Simple test endpoint - NO database calls
+app.get('/api/test', (req, res) => {
+    console.log('Test endpoint called!');
+    res.json({
+        status: 'success',
+        message: 'Server is working!',
+        timestamp: new Date().toISOString(),
+        port: process.env.PORT || 'not set'
+    });
+});
 
 // 📈 API ENDPOINTS
 const dataOrchestrator = new DataCollectionOrchestrator();
