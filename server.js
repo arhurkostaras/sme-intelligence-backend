@@ -276,22 +276,29 @@ class DataCollectionOrchestrator {
                 cwBankData,
                 robertHalfData
            // Collect from all sources simultaneously  
-const dataCollection = await Promise.all([
-    this.statCanAPI.getAccountingServicesPriceIndex(),
-    this.statCanAPI.getAdvancedTechnologySurvey(), 
-    this.isedAPI.getSMEInnovationData(),
-    this.industryScraper.getCWBankResearch(),
-    this.industryScraper.getRobertHalfSalaryData()
-]);
+// Collect from all sources simultaneously  
+let allData = [];
+try {
+    const results = await Promise.all([
+        this.statCanAPI.getAccountingServicesPriceIndex(),
+        this.statCanAPI.getAdvancedTechnologySurvey(), 
+        this.isedAPI.getSMEInnovationData(),
+        this.industryScraper.getCWBankResearch(),
+        this.industryScraper.getRobertHalfSalaryData()
+    ]);
+    
+    // Combine all results into one array
+    for (let i = 0; i < results.length; i++) {
+        if (results[i] && Array.isArray(results[i])) {
+            allData = allData.concat(results[i]);
+        }
+    }
+} catch (error) {
+    console.error('Data collection error:', error);
+}
 
 // Store data in database
-await this.storeMarketData([
-    ...(dataCollection[0] || []),  // statCanAccounting
-    ...(dataCollection[1] || []),  // statCanTech  
-    ...(dataCollection[2] || []),  // isedSME
-    ...(dataCollection[3] || []),  // cwBankData
-    ...(dataCollection[4] || [])   // robertHalfData
-]);
+await this.storeMarketData(allData);
 
            
 
