@@ -284,13 +284,22 @@ class DataCollectionOrchestrator {
             ]);
 
             // Store data in database
-            await this.storeMarketData([
-                ...statCanAccounting || [],
-                ...statCanTech || [],
-                ...isedSME || [],
-                ...cwBankData || [],
-                ...robertHalfData || []
-            ]);
+            // Debug: Log what data we actually collected
+console.log('📊 Data collected:', { 
+    statCanAccounting: statCanAccounting?.length || 0,
+    statCanTech: statCanTech?.length || 0, 
+    isedSME: isedSME?.length || 0,
+    cwBankData: cwBankData?.length || 0,
+    robertHalfData: robertHalfData?.length || 0
+});
+
+await this.storeMarketData([
+    ...(statCanAccounting || []),
+    ...(statCanTech || []),
+    ...(isedSME || []),
+    ...(cwBankData || []),
+    ...(robertHalfData || [])
+]);
 
             console.log('✅ Data collection completed successfully');
             
