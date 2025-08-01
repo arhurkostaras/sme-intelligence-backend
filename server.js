@@ -420,6 +420,20 @@ cron.schedule('0 6 * * *', async () => {
     await dataOrchestrator.collectAllData();
 });
 
+// Root endpoint - Welcome message
+app.get('/', (req, res) => {
+    res.json({
+        message: "🇨🇦 Canadian SME Intelligence API",
+        status: "operational",
+        version: "1.0.0",
+        endpoints: [
+            "GET /api/market-intelligence",
+            "POST /api/sme-submission", 
+            "GET /api/analytics"
+        ],
+        timestamp: new Date().toISOString()
+    });
+});
 // 🚀 START SERVER
 async function startServer() {
     await initializeDatabase();
