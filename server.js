@@ -315,7 +315,7 @@ class DataCollectionOrchestrator {
         }
     }
 
-    async updateCache() {
+    async updateCache(key, expiration, value) {
         // Cache frequently accessed data in Redis
         const recentData = await dbClient.query(
             'SELECT * FROM market_data WHERE is_current = true ORDER BY collection_date DESC'
