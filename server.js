@@ -295,14 +295,6 @@ await this.storeMarketData([
 
            
 
-await this.storeMarketData([
-    ...(statCanAccounting || []),
-    ...(statCanTech || []),
-    ...(isedSME || []),
-    ...(cwBankData || []),
-    ...(robertHalfData || [])
-]);
-
             console.log('✅ Data collection completed successfully');
             
             // Update cache
