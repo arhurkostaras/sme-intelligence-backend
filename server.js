@@ -434,6 +434,33 @@ app.get('/', (req, res) => {
         timestamp: new Date().toISOString()
     });
 });
+});
+
+// Debug endpoint to check database data
+app.get('/api/debug/check-data', async (req, res) => {
+    try {
+        const marketCount = await dbClient.query('SELECT COUNT(*) FROM market_data');
+        const smeCount = await dbClient.query('SELECT COUNT(*) FROM sme_submissions');
+        const cpaCount = await dbClient.query('SELECT COUNT(*) FROM cpa_performance');
+        
+        const sampleMarket = await dbClient.query('SELECT * FROM market_data LIMIT 3');
+        
+        res.json({
+            status: 'success',
+            counts: {
+                market_data: marketCount.rows[0].count,
+                sme_submissions: smeCount.rows[0].count,
+                cpa_performance: cpaCount.rows[0].count
+            },
+            sample_data: sampleMarket.rows,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 🚀 START SERVER
 // 🚀 START SERVER
 async function startServer() {
     await initializeDatabase();
