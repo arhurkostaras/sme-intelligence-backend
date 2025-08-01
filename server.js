@@ -321,7 +321,7 @@ class DataCollectionOrchestrator {
             'SELECT * FROM market_data WHERE is_current = true ORDER BY collection_date DESC'
         );
         
-        await redisClient.setex('latest_market_data', 3600, JSON.stringify(recentData.rows));
+        await redisClient.setEx(key, expiration, JSON.stringify(value))
     }
 }
 
