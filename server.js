@@ -275,7 +275,13 @@ class DataCollectionOrchestrator {
                 isedSME,
                 cwBankData,
                 robertHalfData
-            ] = await Promise.all([
+            const [
+    statCanAccounting,
+    statCanTech, 
+    isedSME,
+    cwBankData,
+    robertHalfData
+] = await Promise.all([
                 this.statCanAPI.getAccountingServicesPriceIndex(),
                 this.statCanAPI.getAdvancedTechnologySurvey(),
                 this.isedAPI.getSMEInnovationData(),
