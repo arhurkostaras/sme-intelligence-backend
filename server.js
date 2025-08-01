@@ -267,14 +267,8 @@ class DataCollectionOrchestrator {
     async collectAllData() {
         console.log('🚀 Starting comprehensive data collection...');
         
-        try {
             // Collect from all sources simultaneously
-            const [
-                statCanAccounting,
-                statCanTech,
-                isedSME,
-                cwBankData,
-                robertHalfData
+           
            // Collect from all sources simultaneously  
 
 try {
