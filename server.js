@@ -307,11 +307,15 @@ class DataCollectionOrchestrator {
         await dbClient.query('UPDATE market_data SET is_current = false WHERE is_current = true');
         
         // Insert new data
-        for (const data of dataArray) {
-            await dbClient.query(
-                'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
-                [data.source, data.metric_name || data.finding, data.metric_value, data.province, data.industry]
-            );
+        try {
+    await dbClient.query(
+        'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
+        [data.source, data.metric_name || data.finding, data.metric_value, data.province, data.industry]
+    );
+    console.log('✅ Inserted data:', data.source, data.metric_name || data.finding);
+} catch (error) {
+    console.error('❌ Database insert error:', error.message, 'Data:', data);
+}
         }
     }
 
