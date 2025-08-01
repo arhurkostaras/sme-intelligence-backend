@@ -276,7 +276,7 @@ class DataCollectionOrchestrator {
                 cwBankData,
                 robertHalfData
            // Collect from all sources simultaneously  
-// Collect from all sources simultaneously  
+
 try {
     var results = await Promise.all([
         this.statCanAPI.getAccountingServicesPriceIndex(),
