@@ -475,7 +475,6 @@ async function startServer() {
     // Initial data collection
 console.log('🔄 Running initial data collection...');
 await dataOrchestrator.collectAllData();
-    await dataOrchestrator.collectAllData();
 
 // Schedule data collection every 24 hours
 console.log('⏰ Setting up 24-hour automated data collection...');
