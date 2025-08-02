@@ -82,6 +82,74 @@ async function createTables() {
         CREATE INDEX IF NOT EXISTS idx_market_data_current ON market_data(is_current);
         CREATE INDEX IF NOT EXISTS idx_submissions_date ON sme_submissions(submission_date);
         CREATE INDEX IF NOT EXISTS idx_cpa_province ON cpa_performance(province);
+        CREATE TABLE IF NOT EXISTS cpa_profiles (
+            id SERIAL PRIMARY KEY,
+            cpa_id VARCHAR(255) UNIQUE NOT NULL,
+            first_name VARCHAR(255),
+            last_name VARCHAR(255),
+            email VARCHAR(255) UNIQUE,
+            phone VARCHAR(50),
+            firm_name VARCHAR(255),
+            firm_size VARCHAR(50),
+            specializations JSONB,
+            industries_served JSONB,
+            certifications JSONB,
+            years_experience INTEGER,
+            hourly_rate_min DECIMAL(10,2),
+            hourly_rate_max DECIMAL(10,2),
+            communication_style VARCHAR(100),
+            software_proficiency JSONB,
+            languages JSONB,
+            province VARCHAR(100),
+            city VARCHAR(255),
+            remote_services BOOLEAN DEFAULT false,
+            profile_status VARCHAR(50) DEFAULT 'pending',
+            verification_status VARCHAR(50) DEFAULT 'unverified',
+            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT true
+        );
+
+        CREATE TABLE IF NOT EXISTS client_preferences (
+            id SERIAL PRIMARY KEY,
+            client_id VARCHAR(255) UNIQUE NOT NULL,
+            business_name VARCHAR(255),
+            industry VARCHAR(255),
+            business_size VARCHAR(100),
+            annual_revenue_range VARCHAR(100),
+            required_services JSONB,
+            preferred_specializations JSONB,
+            budget_range_min DECIMAL(10,2),
+            budget_range_max DECIMAL(10,2),
+            preferred_communication VARCHAR(100),
+            location_preference VARCHAR(255),
+            remote_acceptable BOOLEAN DEFAULT true,
+            urgency_level VARCHAR(50),
+            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS cpa_matches (
+            id SERIAL PRIMARY KEY,
+            client_id VARCHAR(255),
+            cpa_id VARCHAR(255),
+            match_score DECIMAL(5,2),
+            match_factors JSONB,
+            status VARCHAR(50) DEFAULT 'suggested',
+            client_response VARCHAR(50),
+            cpa_response VARCHAR(50),
+            match_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            engagement_started BOOLEAN DEFAULT false,
+            engagement_completed BOOLEAN DEFAULT false,
+            client_satisfaction INTEGER,
+            cpa_satisfaction INTEGER,
+            feedback JSONB
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cpa_profiles_province ON cpa_profiles(province);
+        CREATE INDEX IF NOT EXISTS idx_cpa_profiles_specializations ON cpa_profiles USING GIN(specializations);
+        CREATE INDEX IF NOT EXISTS idx_client_preferences_industry ON client_preferences(industry);
+        CREATE INDEX IF NOT EXISTS idx_cpa_matches_status ON cpa_matches(status);
     `;
     
     await dbClient.query(createTablesQuery);
