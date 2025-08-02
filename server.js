@@ -287,7 +287,6 @@ try {
 
         var allData = [];
     
-    var allData = [];
     for (var i = 0; i < results.length; i++) {
         if (results[i] && Array.isArray(results[i])) {
             allData = allData.concat(results[i]);
