@@ -297,11 +297,11 @@ try {
     // Store data in database
     await this.storeMarketData(allData);
         
-        // 🆕 ADD CPA DATA STORAGE
-        if (cpaIntelligence) {
-            await this.storeCPAData(cpaIntelligence);
-            console.log('✅ CPA market intelligence stored successfully');
-        }
+       // 🆕 ADD CPA DATA STORAGE
+if (cpaIntelligence) {
+    // await this.storeCPAData(cpaIntelligence);
+    console.log('✅ CPA market intelligence collected successfully');
+}
 
     } catch (error) {
     console.error('Data collection error:', error);
