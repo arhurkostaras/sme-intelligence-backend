@@ -325,8 +325,7 @@ if (cpaIntelligence) {
         }
     }
     }  // Line 327 - end of storeMarketData method
-
-    // 🆕 CPA DATA STORAGE METHOD
+// 🆕 CPA DATA STORAGE METHOD
     async storeCPAData(cpaData) {
         try {
             console.log('💾 Storing CPA intelligence data...');
@@ -362,8 +361,8 @@ if (cpaIntelligence) {
     }
 
 }  // Line 328 - end of DataCollectionOrchestrator class
-}
 
+    
 // 🏛️ CPA MARKET INTELLIGENCE COLLECTOR
 class CPAMarketIntelligenceCollector {
     constructor() {
