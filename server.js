@@ -671,6 +671,161 @@ app.get('/api/analytics', async (req, res) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
+});
+
+// 🏛️ CPA PROFILE MANAGEMENT APIs
+
+// Register new CPA profile
+app.post('/api/cpa/register', async (req, res) => {
+    try {
+        const {
+            first_name, last_name, email, phone, firm_name, firm_size,
+            specializations, industries_served, certifications, years_experience,
+            hourly_rate_min, hourly_rate_max, communication_style, 
+            software_proficiency, languages, province, city, remote_services
+        } = req.body;
+
+        const cpa_id = `CPA_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        const result = await dbClient.query(
+            `INSERT INTO cpa_profiles (
+                cpa_id, first_name, last_name, email, phone, firm_name, firm_size,
+                specializations, industries_served, certifications, years_experience,
+                hourly_rate_min, hourly_rate_max, communication_style, 
+                software_proficiency, languages, province, city, remote_services,
+                profile_status, verification_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+            RETURNING *`,
+            [cpa_id, first_name, last_name, email, phone, firm_name, firm_size,
+             JSON.stringify(specializations), JSON.stringify(industries_served), 
+             JSON.stringify(certifications), years_experience, hourly_rate_min, 
+             hourly_rate_max, communication_style, JSON.stringify(software_proficiency), 
+             JSON.stringify(languages), province, city, remote_services, 'pending', 'unverified']
+        );
+
+        res.json({
+            status: 'success',
+            message: 'CPA profile registered successfully',
+            cpa_id: cpa_id,
+            profile: result.rows[0],
+            next_steps: [
+                'Profile review and verification',
+                'Complete specialization details',
+                'Upload certifications',
+                'Activate profile for matching'
+            ]
+        });
+    } catch (error) {
+        console.error('CPA registration error:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Registration failed',
+            error: error.message 
+        });
+    }
+});
+
+// Get CPA profile by ID
+app.get('/api/cpa/profile/:cpa_id', async (req, res) => {
+    try {
+        const { cpa_id } = req.params;
+        
+        const result = await dbClient.query(
+            'SELECT * FROM cpa_profiles WHERE cpa_id = $1 AND is_active = true',
+            [cpa_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'CPA profile not found'
+            });
+        }
+
+        res.json({
+            status: 'success',
+            profile: result.rows[0]
+        });
+    } catch (error) {
+        console.error('CPA profile fetch error:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch profile' });
+    }
+});
+
+// Search CPAs with filters
+app.get('/api/cpa/search', async (req, res) => {
+    try {
+        const { 
+            province, specialization, firm_size, min_rate, max_rate, 
+            remote_services, industry, limit = 20 
+        } = req.query;
+
+        let query = 'SELECT * FROM cpa_profiles WHERE is_active = true AND verification_status = $1';
+        let params = ['verified'];
+        let paramCount = 1;
+
+        if (province) {
+            paramCount++;
+            query += ` AND province = $${paramCount}`;
+            params.push(province);
+        }
+
+        if (specialization) {
+            paramCount++;
+            query += ` AND specializations::text ILIKE $${paramCount}`;
+            params.push(`%${specialization}%`);
+        }
+
+        if (firm_size) {
+            paramCount++;
+            query += ` AND firm_size = $${paramCount}`;
+            params.push(firm_size);
+        }
+
+        if (min_rate) {
+            paramCount++;
+            query += ` AND hourly_rate_min >= $${paramCount}`;
+            params.push(min_rate);
+        }
+
+        if (max_rate) {
+            paramCount++;
+            query += ` AND hourly_rate_max <= $${paramCount}`;
+            params.push(max_rate);
+        }
+
+        if (remote_services === 'true') {
+            query += ' AND remote_services = true';
+        }
+
+        if (industry) {
+            paramCount++;
+            query += ` AND industries_served::text ILIKE $${paramCount}`;
+            params.push(`%${industry}%`);
+        }
+
+        paramCount++;
+        query += ` ORDER BY created_date DESC LIMIT $${paramCount}`;
+        params.push(limit);
+
+        const result = await dbClient.query(query, params);
+
+        res.json({
+            status: 'success',
+            count: result.rows.length,
+            cpas: result.rows,
+            filters_applied: {
+                province, specialization, firm_size, min_rate, max_rate, 
+                remote_services, industry
+            }
+        });
+    } catch (error) {
+        console.error('CPA search error:', error);
+        res.status(500).json({ status: 'error', message: 'Search failed' });
+    }
+});
+
+// Get real-time analytics
 
 // 🕐 AUTOMATED DATA COLLECTION SCHEDULE
 // Every day at 6 AM collect fresh data
