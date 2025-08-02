@@ -1008,9 +1008,171 @@ class CPAMatchingEngine {
 }
 
 // 🏛️ API ENDPOINTS
-// 🚀 API ENDPOINTS
 
-// 📈 API ENDPOINTS
+
+// 🧠 AI-POWERED CPA MATCHING APIs
+
+// Client preference registration and matching
+app.post('/api/client/register-preferences', async (req, res) => {
+    try {
+        const {
+            business_name, industry, business_size, annual_revenue_range,
+            required_services, preferred_specializations, budget_range_min, budget_range_max,
+            preferred_communication, location_preference, remote_acceptable, urgency_level
+        } = req.body;
+
+        const client_id = `CLIENT_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        const result = await dbClient.query(
+            `INSERT INTO client_preferences (
+                client_id, business_name, industry, business_size, annual_revenue_range,
+                required_services, preferred_specializations, budget_range_min, budget_range_max,
+                preferred_communication, location_preference, remote_acceptable, urgency_level
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING *`,
+            [client_id, business_name, industry, business_size, annual_revenue_range,
+             JSON.stringify(required_services), JSON.stringify(preferred_specializations),
+             budget_range_min, budget_range_max, preferred_communication, 
+             location_preference, remote_acceptable, urgency_level]
+        );
+
+        res.json({
+            status: 'success',
+            message: 'Client preferences registered successfully',
+            client_id: client_id,
+            preferences: result.rows[0],
+            next_steps: [
+                'AI matching will begin immediately',
+                'Top CPA recommendations will be generated',
+                'You will receive match notifications',
+                'Review and connect with recommended CPAs'
+            ]
+        });
+    } catch (error) {
+        console.error('Client registration error:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Registration failed',
+            error: error.message 
+        });
+    }
+});
+
+// AI-powered CPA matching endpoint
+app.post('/api/cpa/find-matches', async (req, res) => {
+    try {
+        const { client_preferences, limit = 10 } = req.body;
+
+        console.log('🧠 AI Matching Request:', { 
+            industry: client_preferences.industry,
+            services: client_preferences.required_services,
+            location: client_preferences.location_preference 
+        });
+
+        // Get all verified CPAs from database
+        const cpaResult = await dbClient.query(
+            'SELECT * FROM cpa_profiles WHERE verification_status = $1 AND is_active = $2',
+            ['verified', true]
+        );
+
+        if (cpaResult.rows.length === 0) {
+            return res.json({
+                status: 'success',
+                message: 'No verified CPAs available for matching',
+                matches: [],
+                count: 0
+            });
+        }
+
+        // Initialize AI matching engine
+        const matchingEngine = new CPAMatchingEngine();
+        
+        // Find top matches using AI algorithm
+        const topMatches = await matchingEngine.findTopMatches(
+            client_preferences, 
+            cpaResult.rows, 
+            limit
+        );
+
+        // Store match results in database
+        for (const match of topMatches) {
+            await dbClient.query(
+                `INSERT INTO cpa_matches (
+                    client_id, cpa_id, match_score, match_factors, status
+                ) VALUES ($1, $2, $3, $4, $5)`,
+                [client_preferences.client_id || 'temp_client', match.cpa_id, 
+                 match.match_score, JSON.stringify(match.match_factors), 'suggested']
+            );
+        }
+
+        res.json({
+            status: 'success',
+            message: 'AI matching completed successfully',
+            matches: topMatches,
+            count: topMatches.length,
+            matching_algorithm: 'CPAMatchingEngine v1.0',
+            factors_considered: [
+                'Specialization Match (35%)',
+                'Location Preference (20%)', 
+                'Budget Alignment (15%)',
+                'Communication Style (12%)',
+                'Firm Size Preference (10%)',
+                'Availability & Urgency (8%)'
+            ],
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('AI matching error:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Matching failed',
+            error: error.message 
+        });
+    }
+});
+
+// Get match history and analytics
+app.get('/api/matches/analytics/:client_id', async (req, res) => {
+    try {
+        const { client_id } = req.params;
+        
+        const matchHistory = await dbClient.query(
+            `SELECT cm.*, cp.first_name, cp.last_name, cp.firm_name, cp.specializations
+             FROM cpa_matches cm
+             JOIN cpa_profiles cp ON cm.cpa_id = cp.cpa_id
+             WHERE cm.client_id = $1
+             ORDER BY cm.match_date DESC`,
+            [client_id]
+        );
+
+        const analytics = {
+            total_matches: matchHistory.rows.length,
+            average_match_score: matchHistory.rows.length > 0 
+                ? Math.round(matchHistory.rows.reduce((sum, m) => sum + parseFloat(m.match_score), 0) / matchHistory.rows.length)
+                : 0,
+            engagement_rate: matchHistory.rows.filter(m => m.client_response === 'interested').length,
+            successful_connections: matchHistory.rows.filter(m => m.engagement_started).length,
+            top_match_score: Math.max(...matchHistory.rows.map(m => parseFloat(m.match_score)), 0)
+        };
+
+        res.json({
+            status: 'success',
+            client_id: client_id,
+            match_history: matchHistory.rows,
+            analytics: analytics,
+            recommendations: analytics.average_match_score < 70 
+                ? ['Consider expanding location preferences', 'Review budget range', 'Add more specialization options']
+                : ['Great matching profile!', 'High compatibility scores', 'Strong CPA options available']
+        });
+
+    } catch (error) {
+        console.error('Match analytics error:', error);
+        res.status(500).json({ status: 'error', message: 'Analytics retrieval failed' });
+    }
+});
+
+const dataOrchestrator = new DataCollectionOrchestrator();
 const dataOrchestrator = new DataCollectionOrchestrator();
 
 // Get latest market intelligence
