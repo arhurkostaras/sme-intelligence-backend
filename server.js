@@ -304,7 +304,6 @@ try {
         }
 
     } catch (error) {
-} catch (error) {
     console.error('Data collection error:', error);
 }
 }
