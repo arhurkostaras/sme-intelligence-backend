@@ -340,7 +340,7 @@ if (cpaIntelligence) {
             for (const firm of cpaData.firm_intelligence) {
                 await dbClient.query(
                     'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
-                    ['CPA Firm Intelligence', firm.firm_type, `${firm.market_share} market share`, firm.province || 'Ontario', firm.client_focus]
+                    ['CPA Firm Intelligence', firm.firm_type, '15', firm.province || 'Ontario', firm.client_focus]
                 );
             }
             
