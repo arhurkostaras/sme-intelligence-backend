@@ -326,7 +326,7 @@ if (cpaIntelligence) {
     }
     }  // Line 327 - end of storeMarketData method
             async storeCPAData(cpaData) {
-        try {
+            try {
             console.log('💾 Storing CPA intelligence data...');
             
             // Store CPA salary benchmarks
