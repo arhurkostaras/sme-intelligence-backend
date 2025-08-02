@@ -299,7 +299,7 @@ try {
         
        // 🆕 ADD CPA DATA STORAGE
 if (cpaIntelligence) {
-    // await this.storeCPAData(cpaIntelligence);
+    await this.storeCPAData(cpaIntelligence);
     console.log('✅ CPA market intelligence collected successfully');
 }
 
@@ -325,6 +325,44 @@ if (cpaIntelligence) {
             }
         }
     }
+    }  // Line 327 - end of storeMarketData method
+
+    // 🆕 CPA DATA STORAGE METHOD
+    async storeCPAData(cpaData) {
+        try {
+            console.log('💾 Storing CPA intelligence data...');
+            
+            // Store CPA salary benchmarks
+            for (const salary of cpaData.cpa_salaries) {
+                await dbClient.query(
+                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
+                    ['CPA Salary Intelligence', salary.role, salary.salary_range, salary.province || 'Ontario', salary.specialization, 'cpa_salary']
+                );
+            }
+            
+            // Store firm intelligence
+            for (const firm of cpaData.firm_intelligence) {
+                await dbClient.query(
+                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
+                    ['CPA Firm Intelligence', firm.firm_type, `${firm.market_share} market share`, firm.province || 'Ontario', firm.client_focus, 'firm_data']
+                );
+            }
+            
+            // Store demand patterns
+            for (const demand of cpaData.demand_patterns) {
+                await dbClient.query(
+                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
+                    ['CPA Demand Intelligence', demand.industry, demand.demand_level, 'Canada', demand.industry, 'demand_pattern']
+                );
+            }
+            
+            console.log('✅ CPA intelligence data stored successfully');
+        } catch (error) {
+            console.error('❌ CPA data storage error:', error);
+        }
+    }
+
+}  // Line 328 - end of DataCollectionOrchestrator class
 }
 
 // 🏛️ CPA MARKET INTELLIGENCE COLLECTOR
