@@ -671,7 +671,6 @@ app.get('/api/analytics', async (req, res) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
-});
 
 // 🏛️ CPA PROFILE MANAGEMENT APIs
 
