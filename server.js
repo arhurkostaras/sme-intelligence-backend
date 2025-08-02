@@ -279,7 +279,6 @@ try {
         this.industryScraper.getCWBankResearch(),
         this.industryScraper.getRobertHalfSalaryData()
     ]);
-    ]);
 
         // 🆕 ADD CPA INTELLIGENCE COLLECTION
         console.log('💼 Initializing CPA market intelligence...');
