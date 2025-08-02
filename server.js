@@ -326,7 +326,7 @@ if (cpaIntelligence) {
     }
     }  // Line 327 - end of storeMarketData method
 // 🆕 CPA DATA STORAGE METHOD
-    async storeCPAData(cpaData) {
+        async storeCPAData(cpaData) {
         try {
             console.log('💾 Storing CPA intelligence data...');
             
