@@ -323,9 +323,8 @@ if (cpaIntelligence) {
                 console.error('❌ Database insert error:', error.message, 'Data:', data);
             }
         }
-    }
     }  // Line 327 - end of storeMarketData method
-            async storeCPAData(cpaData) {
+    async storeCPAData(cpaData){ 
             try {
             console.log('💾 Storing CPA intelligence data...');
             
