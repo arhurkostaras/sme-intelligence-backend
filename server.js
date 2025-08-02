@@ -331,24 +331,24 @@ if (cpaIntelligence) {
             // Store CPA salary benchmarks
             for (const salary of cpaData.cpa_salaries) {
                 await dbClient.query(
-                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
-                    ['CPA Salary Intelligence', salary.role, salary.salary_range, salary.province || 'Ontario', salary.specialization, 'cpa_salary']
+                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
+                    ['CPA Salary Intelligence', salary.role, salary.salary_range, salary.province || 'Ontario', salary.specialization]
                 );
             }
             
             // Store firm intelligence
             for (const firm of cpaData.firm_intelligence) {
                 await dbClient.query(
-                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
-                    ['CPA Firm Intelligence', firm.firm_type, `${firm.market_share} market share`, firm.province || 'Ontario', firm.client_focus, 'firm_data']
+                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
+                    ['CPA Firm Intelligence', firm.firm_type, `${firm.market_share} market share`, firm.province || 'Ontario', firm.client_focus]
                 );
             }
             
             // Store demand patterns
             for (const demand of cpaData.demand_patterns) {
                 await dbClient.query(
-                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
-                    ['CPA Demand Intelligence', demand.industry, demand.demand_level, 'Canada', demand.industry, 'demand_pattern']
+                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
+                    ['CPA Demand Intelligence', demand.industry, demand.demand_level, 'Canada', demand.industry]
                 );
             }
             
