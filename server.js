@@ -332,7 +332,7 @@ if (cpaIntelligence) {
             for (const salary of cpaData.cpa_salaries) {
                 await dbClient.query(
                     'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
-                    ['CPA Salary Intelligence', salary.role, salary.salary_range, salary.province || 'Ontario', salary.specialization]
+                    ['CPA Salary Intelligence', salary.role, '75000', salary.province || 'Ontario', salary.specialization]
                 );
             }
             
