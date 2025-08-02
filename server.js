@@ -475,6 +475,21 @@ async function startServer() {
     // Initial data collection
 console.log('🔄 Running initial data collection...');
 await dataOrchestrator.collectAllData();
+    await dataOrchestrator.collectAllData();
+
+// Schedule data collection every 24 hours
+console.log('⏰ Setting up 24-hour automated data collection...');
+setInterval(async () => {
+    console.log('🔄 Running scheduled 24-hour data collection...');
+    try {
+        await dataOrchestrator.collectAllData();
+        console.log('✅ Scheduled data collection completed successfully');
+    } catch (error) {
+        console.error('❌ Scheduled data collection failed:', error);
+    }
+}, 24 * 60 * 60 * 1000); // 24 hours in milliseconds
+
+console.log('✅ 24-hour data collection scheduler activated');
 }
 
 startServer().catch(console.error);
