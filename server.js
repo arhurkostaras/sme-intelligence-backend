@@ -301,7 +301,7 @@ try {
             console.log('✅ Data collection completed successfully');
             
             // Update cache
-            await this.updateCache();
+        
             
         } catch (error) {
             console.error('❌ Data collection failed:', error);
