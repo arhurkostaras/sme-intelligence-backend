@@ -348,7 +348,7 @@ if (cpaIntelligence) {
             for (const demand of cpaData.demand_patterns) {
                 await dbClient.query(
                     'INSERT INTO market_data (source, metric_name, metric_value, province, industry) VALUES ($1, $2, $3, $4, $5)',
-                    ['CPA Demand Intelligence', demand.industry, demand.demand_level, 'Canada', demand.industry]
+                    ['CPA Demand Intelligence', demand.industry, '5', 'Canada', demand.industry]
                 );
             }
             
