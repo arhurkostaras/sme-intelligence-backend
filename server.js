@@ -294,20 +294,6 @@ try {
 }
 }
 
-// Store data in database
-
-           
-
-            console.log('✅ Data collection completed successfully');
-            
-            // Update cache
-        
-            
-        } catch (error) {
-            console.error('❌ Data collection failed:', error);
-        }
-    }
-
     async storeMarketData(dataArray) {
         // Mark previous data as not current
         await dbClient.query('UPDATE market_data SET is_current = false WHERE is_current = true');
