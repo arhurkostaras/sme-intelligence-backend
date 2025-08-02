@@ -327,52 +327,6 @@ if (cpaIntelligence) {
     }
 }
 
-    // 🆕 ADD CPA DATA STORAGE METHOD
-    async storeCPAData(cpaData) {
-        try {
-            // Store CPA salary benchmarks
-            for (const salary of cpaData.cpa_salaries) {
-                await dbClient.query(
-                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
-                    ['CPA Salary Intelligence', salary.role, salary.salary_range, salary.province, salary.specialization, 'cpa_salary']
-                );
-            }
-            
-            // Store firm intelligence
-            for (const firm of cpaData.firm_intelligence) {
-                await dbClient.query(
-                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
-                    ['CPA Firm Intelligence', firm.firm_type, `${firm.market_share} market share`, firm.province, firm.client_focus, 'firm_data']
-                );
-            }
-            
-            // Store demand patterns
-            for (const demand of cpaData.demand_patterns) {
-                await dbClient.query(
-                    'INSERT INTO market_data (source, metric_name, metric_value, province, industry, data_type) VALUES ($1, $2, $3, $4, $5, $6)',
-                    ['CPA Demand Intelligence', demand.industry, demand.demand_level, 'Canada', demand.industry, 'demand_pattern']
-                );
-            }
-            
-            console.log('✅ CPA intelligence data stored in database');
-        } catch (error) {
-            console.error('❌ CPA data storage error:', error);
-        }
-    }
-
-    async updateCache(key, expiration, value) {
-
-    async updateCache(key, expiration, value) {
-        // Cache frequently accessed data in Redis
-        const recentData = await dbClient.query(
-            'SELECT * FROM market_data WHERE is_current = true ORDER BY collection_date DESC'
-        );
-        
-        // await redisClient.setEx('latest_market_data', 3600, JSON.stringify(recentData))
-    }
-}
-}
-
 // 🏛️ CPA MARKET INTELLIGENCE COLLECTOR
 class CPAMarketIntelligenceCollector {
     constructor() {
