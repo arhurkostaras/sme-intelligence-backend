@@ -295,7 +295,6 @@ try {
 }
 
 // Store data in database
-await this.storeMarketData(allData);
 
            
 
