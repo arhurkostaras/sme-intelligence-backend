@@ -742,6 +742,272 @@ class CPAMarketIntelligenceCollector {
     }
 }
 
+// 🧠 AI-POWERED CPA MATCHING ENGINE
+class CPAMatchingEngine {
+    constructor() {
+        this.matchingWeights = {
+            specialization_match: 0.35,      // 35% - Most important factor
+            location_preference: 0.20,       // 20% - Geographic compatibility  
+            budget_alignment: 0.15,          // 15% - Rate compatibility
+            communication_style: 0.12,       // 12% - Soft skills match
+            firm_size_preference: 0.10,      // 10% - Firm size alignment
+            availability_urgency: 0.08       // 8% - Timeline compatibility
+        };
+    }
+
+    // Calculate comprehensive match score between client and CPA
+    async calculateMatchScore(clientProfile, cpaProfile) {
+        console.log(`🎯 Calculating match score for client industry: ${clientProfile.industry} with CPA: ${cpaProfile.cpa_id}`);
+        
+        try {
+            let totalScore = 0;
+            let matchFactors = {};
+
+            // 1. Specialization Match (35% weight)
+            const specializationScore = this.calculateSpecializationMatch(
+                clientProfile.required_services, 
+                cpaProfile.specializations
+            );
+            matchFactors.specialization_score = specializationScore;
+            totalScore += specializationScore * this.matchingWeights.specialization_match;
+
+            // 2. Location Preference (20% weight)
+            const locationScore = this.calculateLocationMatch(
+                clientProfile.location_preference,
+                cpaProfile.province,
+                cpaProfile.remote_services,
+                clientProfile.remote_acceptable
+            );
+            matchFactors.location_score = locationScore;
+            totalScore += locationScore * this.matchingWeights.location_preference;
+
+            // 3. Budget Alignment (15% weight)
+            const budgetScore = this.calculateBudgetAlignment(
+                clientProfile.budget_range_min,
+                clientProfile.budget_range_max,
+                cpaProfile.hourly_rate_min,
+                cpaProfile.hourly_rate_max
+            );
+            matchFactors.budget_score = budgetScore;
+            totalScore += budgetScore * this.matchingWeights.budget_alignment;
+
+            // 4. Communication Style (12% weight)
+            const communicationScore = this.calculateCommunicationMatch(
+                clientProfile.preferred_communication,
+                cpaProfile.communication_style
+            );
+            matchFactors.communication_score = communicationScore;
+            totalScore += communicationScore * this.matchingWeights.communication_style;
+
+            // 5. Firm Size Preference (10% weight)
+            const firmSizeScore = this.calculateFirmSizeMatch(
+                clientProfile.business_size,
+                cpaProfile.firm_size
+            );
+            matchFactors.firm_size_score = firmSizeScore;
+            totalScore += firmSizeScore * this.matchingWeights.firm_size_preference;
+
+            // 6. Availability & Urgency (8% weight)
+            const urgencyScore = this.calculateUrgencyMatch(
+                clientProfile.urgency_level,
+                cpaProfile.years_experience
+            );
+            matchFactors.urgency_score = urgencyScore;
+            totalScore += urgencyScore * this.matchingWeights.availability_urgency;
+
+            // Final match score (0-100)
+            const finalScore = Math.round(totalScore * 100);
+            
+            console.log(`✅ Match calculated: ${finalScore}% compatibility`);
+            
+            return {
+                match_score: finalScore,
+                match_factors: matchFactors,
+                recommendation_level: this.getRecommendationLevel(finalScore)
+            };
+
+        } catch (error) {
+            console.error('❌ Match calculation error:', error);
+            return { match_score: 0, match_factors: {}, recommendation_level: 'Error' };
+        }
+    }
+
+    // Calculate specialization compatibility
+    calculateSpecializationMatch(requiredServices, cpaSpecializations) {
+        if (!requiredServices || !cpaSpecializations) return 0;
+        
+        const required = Array.isArray(requiredServices) ? requiredServices : [requiredServices];
+        const available = Array.isArray(cpaSpecializations) ? cpaSpecializations : [cpaSpecializations];
+        
+        let matches = 0;
+        let totalRequired = required.length;
+        
+        for (const service of required) {
+            for (const specialization of available) {
+                if (service.toLowerCase().includes(specialization.toLowerCase()) ||
+                    specialization.toLowerCase().includes(service.toLowerCase())) {
+                    matches++;
+                    break;
+                }
+            }
+        }
+        
+        return totalRequired > 0 ? matches / totalRequired : 0;
+    }
+
+    // Calculate location compatibility
+    calculateLocationMatch(clientLocation, cpaProvince, cpaRemote, clientRemoteOk) {
+        // Perfect match if both accept remote
+        if (cpaRemote && clientRemoteOk) return 1.0;
+        
+        // Good match if same province
+        if (clientLocation && cpaProvince && 
+            clientLocation.toLowerCase().includes(cpaProvince.toLowerCase())) {
+            return 0.9;
+        }
+        
+        // Partial match if remote is an option for one party
+        if (cpaRemote || clientRemoteOk) return 0.7;
+        
+        // Low compatibility if location mismatch and no remote
+        return 0.3;
+    }
+
+    // Calculate budget alignment
+    calculateBudgetAlignment(clientMinBudget, clientMaxBudget, cpaMinRate, cpaMaxRate) {
+        if (!clientMinBudget || !clientMaxBudget || !cpaMinRate || !cpaMaxRate) return 0.5;
+        
+        // Check for overlap in budget ranges
+        const overlapStart = Math.max(clientMinBudget, cpaMinRate);
+        const overlapEnd = Math.min(clientMaxBudget, cpaMaxRate);
+        
+        if (overlapStart <= overlapEnd) {
+            // Calculate percentage of overlap
+            const overlapSize = overlapEnd - overlapStart;
+            const clientRange = clientMaxBudget - clientMinBudget;
+            const cpaRange = cpaMaxRate - cpaMinRate;
+            const avgRange = (clientRange + cpaRange) / 2;
+            
+            return Math.min(1.0, overlapSize / avgRange);
+        }
+        
+        // No overlap - calculate distance penalty
+        const distance = Math.min(
+            Math.abs(clientMaxBudget - cpaMinRate),
+            Math.abs(cpaMaxRate - clientMinBudget)
+        );
+        
+        return Math.max(0, 1 - (distance / clientMaxBudget));
+    }
+
+    // Calculate communication style compatibility
+    calculateCommunicationMatch(clientPreference, cpaStyle) {
+        if (!clientPreference || !cpaStyle) return 0.7; // Neutral if unknown
+        
+        const preference = clientPreference.toLowerCase();
+        const style = cpaStyle.toLowerCase();
+        
+        if (preference === style) return 1.0;
+        
+        // Compatible combinations
+        const compatiblePairs = [
+            ['formal', 'professional'],
+            ['casual', 'friendly'],
+            ['direct', 'efficient'],
+            ['collaborative', 'consultative']
+        ];
+        
+        for (const [style1, style2] of compatiblePairs) {
+            if ((preference.includes(style1) && style.includes(style2)) ||
+                (preference.includes(style2) && style.includes(style1))) {
+                return 0.8;
+            }
+        }
+        
+        return 0.5; // Neutral compatibility
+    }
+
+    // Calculate firm size compatibility
+    calculateFirmSizeMatch(businessSize, firmSize) {
+        if (!businessSize || !firmSize) return 0.7;
+        
+        const sizeMap = {
+            'startup': ['solo', 'small'],
+            'small': ['solo', 'small', 'medium'],
+            'medium': ['small', 'medium', 'large'],
+            'large': ['medium', 'large', 'big4'],
+            'enterprise': ['large', 'big4']
+        };
+        
+        const business = businessSize.toLowerCase();
+        const firm = firmSize.toLowerCase();
+        
+        if (sizeMap[business] && sizeMap[business].some(size => firm.includes(size))) {
+            return 1.0;
+        }
+        
+        return 0.4; // Lower compatibility for size mismatch
+    }
+
+    // Calculate urgency compatibility
+    calculateUrgencyMatch(clientUrgency, cpaExperience) {
+        if (!clientUrgency) return 0.8;
+        
+        const urgency = clientUrgency.toLowerCase();
+        const experience = cpaExperience || 5;
+        
+        if (urgency.includes('immediate') || urgency.includes('urgent')) {
+            // Urgent needs favor experienced CPAs
+            return experience >= 10 ? 1.0 : experience >= 5 ? 0.8 : 0.6;
+        }
+        
+        if (urgency.includes('flexible') || urgency.includes('planning')) {
+            // Flexible timeline works for all experience levels
+            return 0.9;
+        }
+        
+        return 0.8; // Standard compatibility
+    }
+
+    // Get recommendation level based on score
+    getRecommendationLevel(score) {
+        if (score >= 90) return 'Excellent Match';
+        if (score >= 80) return 'Very Good Match';
+        if (score >= 70) return 'Good Match';
+        if (score >= 60) return 'Fair Match';
+        return 'Poor Match';
+    }
+
+    // Find top matches for a client
+    async findTopMatches(clientProfile, availableCPAs, limit = 10) {
+        console.log(`🔍 Finding top ${limit} CPA matches for client in ${clientProfile.industry} industry`);
+        
+        const matches = [];
+        
+        for (const cpa of availableCPAs) {
+            if (cpa.verification_status === 'verified' && cpa.is_active) {
+                const matchResult = await this.calculateMatchScore(clientProfile, cpa);
+                
+                matches.push({
+                    cpa_id: cpa.cpa_id,
+                    cpa_profile: cpa,
+                    ...matchResult
+                });
+            }
+        }
+        
+        // Sort by match score and return top results
+        const topMatches = matches
+            .sort((a, b) => b.match_score - a.match_score)
+            .slice(0, limit);
+        
+        console.log(`✅ Found ${topMatches.length} qualified matches, top score: ${topMatches[0]?.match_score || 0}%`);
+        
+        return topMatches;
+    }
+}
+
+// 🏛️ API ENDPOINTS
 // 🚀 API ENDPOINTS
 
 // 📈 API ENDPOINTS
