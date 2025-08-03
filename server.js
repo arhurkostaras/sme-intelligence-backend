@@ -1214,6 +1214,72 @@ app.post('/api/cpa/verify/:cpa_id', async (req, res) => {
     }
 });
 
+// 🧪 TEMPORARY TEST ENDPOINT - AI MATCHING WITH MOCK DATA
+app.post('/api/cpa/test-matching', async (req, res) => {
+    try {
+        const { client_preferences, limit = 5 } = req.body;
+
+        console.log('🧠 AI Matching Test with Mock Data');
+
+        // Mock CPA for testing
+        const mockCPAs = [{
+            cpa_id: 'CPA_TEST_001',
+            first_name: 'Sarah',
+            last_name: 'Williams',
+            firm_name: 'Williams Professional Services',
+            specializations: ['Tax Planning', 'Small Business Accounting'],
+            industries_served: ['Technology', 'Healthcare'],
+            province: 'Ontario',
+            city: 'Toronto',
+            hourly_rate_min: 180,
+            hourly_rate_max: 220,
+            communication_style: 'professional',
+            firm_size: 'small',
+            remote_services: true,
+            verification_status: 'verified',
+            is_active: true
+        }];
+
+        // Initialize AI matching engine
+        const matchingEngine = new CPAMatchingEngine();
+        
+        // Find top matches using AI algorithm
+        const topMatches = await matchingEngine.findTopMatches(
+            client_preferences, 
+            mockCPAs, 
+            limit
+        );
+
+        res.json({
+            status: 'success',
+            message: 'AI matching test completed successfully',
+            matches: topMatches,
+            count: topMatches.length,
+            matching_algorithm: 'CPAMatchingEngine v1.0 - TEST MODE',
+            factors_considered: [
+                'Specialization Match (35%)',
+                'Location Preference (20%)', 
+                'Budget Alignment (15%)',
+                'Communication Style (12%)',
+                'Firm Size Preference (10%)',
+                'Availability & Urgency (8%)'
+            ],
+            timestamp: new Date().toISOString(),
+            note: 'Using mock data for testing - database persistence issue being resolved'
+        });
+
+    } catch (error) {
+        console.error('AI matching test error:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Matching test failed',
+            error: error.message 
+        });
+    }
+});
+
+const dataOrchestrator = new DataCollectionOrchestrator();
+
 const dataOrchestrator = new DataCollectionOrchestrator();
 
 
