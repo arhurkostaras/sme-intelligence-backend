@@ -1216,7 +1216,6 @@ app.post('/api/cpa/verify/:cpa_id', async (req, res) => {
 
 const dataOrchestrator = new DataCollectionOrchestrator();
 
-const dataOrchestrator = new DataCollectionOrchestrator();
 
 // Get latest market intelligence
 app.get('/api/market-intelligence', async (req, res) => {
