@@ -1280,8 +1280,6 @@ app.post('/api/cpa/test-matching', async (req, res) => {
 
 const dataOrchestrator = new DataCollectionOrchestrator();
 
-const dataOrchestrator = new DataCollectionOrchestrator();
-
 
 // Get latest market intelligence
 app.get('/api/market-intelligence', async (req, res) => {
