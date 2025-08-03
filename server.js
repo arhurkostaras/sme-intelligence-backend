@@ -1173,7 +1173,6 @@ app.get('/api/matches/analytics/:client_id', async (req, res) => {
 });
 
 const dataOrchestrator = new DataCollectionOrchestrator();
-const dataOrchestrator = new DataCollectionOrchestrator();
 
 // Get latest market intelligence
 app.get('/api/market-intelligence', async (req, res) => {
