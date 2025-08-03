@@ -1172,6 +1172,50 @@ app.get('/api/matches/analytics/:client_id', async (req, res) => {
     }
 });
 
+// 🔐 CPA VERIFICATION ENDPOINT FOR TESTING
+app.post('/api/cpa/verify/:cpa_id', async (req, res) => {
+    try {
+        const { cpa_id } = req.params;
+        
+        console.log(`🔐 Verifying CPA: ${cpa_id}`);
+        
+        const result = await dbClient.query(
+            'UPDATE cpa_profiles SET verification_status = $1 WHERE cpa_id = $2 RETURNING *',
+            ['verified', cpa_id]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'CPA profile not found'
+            });
+        }
+        
+        res.json({
+            status: 'success',
+            message: 'CPA profile verified successfully! Ready for AI matching.',
+            cpa_id: cpa_id,
+            verification_status: 'verified',
+            cpa_profile: result.rows[0],
+            next_steps: [
+                'CPA is now eligible for AI matching',
+                'Profile will appear in client searches',
+                'Can receive match requests',
+                'Ready for client connections'
+            ]
+        });
+    } catch (error) {
+        console.error('❌ CPA verification error:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Verification failed',
+            error: error.message 
+        });
+    }
+});
+
+const dataOrchestrator = new DataCollectionOrchestrator();
+
 const dataOrchestrator = new DataCollectionOrchestrator();
 
 // Get latest market intelligence
