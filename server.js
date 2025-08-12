@@ -1057,6 +1057,56 @@ app.post('/api/client/register-preferences', async (req, res) => {
         });
     }
 });
+// SME Friction Request Endpoint - Business Questionnaire
+app.post('/api/sme-friction-request', async (req, res) => {
+    try {
+        const {
+            request_id, pain_point, business_type, business_size,
+            urgency_level, services_needed, time_being_lost,
+            budget_range, additional_context, contact_info
+        } = req.body;
+
+        console.log('🎯 New SME Friction Request:', {
+            request_id,
+            business_type,
+            pain_point,
+            urgency_level
+        });
+
+        const result = await dbClient.query(
+            `INSERT INTO sme_friction_requests 
+             (request_id, pain_point, business_type, business_size, urgency_level, 
+              services_needed, time_being_lost, budget_range, additional_context, contact_info, created_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW()) 
+             RETURNING *`,
+            [request_id, pain_point, business_type, business_size, urgency_level,
+             services_needed, time_being_lost, budget_range, additional_context, contact_info]
+        );
+
+        console.log('✅ SME Friction Request stored:', result.rows[0]);
+
+        res.status(201).json({
+            success: true,
+            message: 'SME friction request submitted successfully',
+            data: result.rows[0],
+            next_steps: [
+                'AI analysis of your business needs',
+                'Perfect CPA matching in progress', 
+                'You will receive matches within 24 hours',
+                'Direct contact with top 3 CPA recommendations'
+            ],
+            request_id: request_id
+        });
+
+    } catch (error) {
+        console.error('❌ Error creating SME friction request:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to submit friction request',
+            error: error.message
+        });
+    }
+});
 
 // AI-powered CPA matching endpoint
 app.post('/api/cpa/find-matches', async (req, res) => {
