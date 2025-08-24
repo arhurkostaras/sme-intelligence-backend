@@ -68,6 +68,22 @@ async function createTables() {
             submission_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS sme_friction_requests (
+            id SERIAL PRIMARY KEY,
+            request_id VARCHAR(255),
+            session_id VARCHAR(255),
+            pain_point VARCHAR(255),
+            business_type VARCHAR(255),
+            business_size VARCHAR(255),
+            urgency_level VARCHAR(255),
+            services_needed TEXT,
+            time_being_lost VARCHAR(255),
+            budget_range VARCHAR(255),
+            additional_context TEXT,
+            contact_info TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS cpa_performance (
             id SERIAL PRIMARY KEY,
             cpa_name VARCHAR(200),
@@ -82,6 +98,7 @@ async function createTables() {
         CREATE INDEX IF NOT EXISTS idx_market_data_current ON market_data(is_current);
         CREATE INDEX IF NOT EXISTS idx_submissions_date ON sme_submissions(submission_date);
         CREATE INDEX IF NOT EXISTS idx_cpa_province ON cpa_performance(province);
+        CREATE INDEX IF NOT EXISTS idx_sme_friction_session ON sme_friction_requests(session_id);
         CREATE TABLE IF NOT EXISTS cpa_profiles (
             id SERIAL PRIMARY KEY,
             cpa_id VARCHAR(255) UNIQUE NOT NULL,
