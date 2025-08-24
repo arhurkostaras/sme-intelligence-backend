@@ -1128,6 +1128,69 @@ app.post('/api/sme-friction-request', async (req, res) => {
     }
 });
 
+// Retrieve questionnaire data by session ID
+app.get('/api/questionnaire/retrieve/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        
+        console.log('Retrieving questionnaire data for session:', sessionId);
+        
+        const result = await dbClient.query(
+            'SELECT * FROM sme_friction_requests WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1',
+            [sessionId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found or expired'
+            });
+        }
+
+        const questionnaireData = result.rows[0];
+        
+        // Parse contact info safely
+        let contactInfo = {};
+        try {
+            contactInfo = JSON.parse(questionnaireData.contact_info || '{}');
+        } catch (e) {
+            console.log('Could not parse contact_info, using raw data');
+            contactInfo = { raw: questionnaireData.contact_info };
+        }
+
+        res.json({
+            success: true,
+            session_id: sessionId,
+            data: questionnaireData,
+            formatted_for_matching: {
+                client_id: sessionId,
+                business_name: contactInfo.business_name || '',
+                business_type: questionnaireData.business_type,
+                industry: questionnaireData.business_type,
+                business_size: questionnaireData.business_size,
+                required_services: questionnaireData.services_needed ? 
+                    questionnaireData.services_needed.split(',') : [],
+                urgency_level: questionnaireData.urgency_level,
+                pain_point: questionnaireData.pain_point,
+                budget_range: questionnaireData.budget_range,
+                time_being_lost: questionnaireData.time_being_lost,
+                location_preference: contactInfo.location || 'remote-ok',
+                preferred_communication: 'professional',
+                remote_acceptable: true,
+                contact_info: contactInfo
+            }
+        });
+
+    } catch (error) {
+        console.error('Error retrieving questionnaire data:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to retrieve questionnaire data',
+            error: error.message
+        });
+    }
+});
+
 // AI-powered CPA matching endpoint
 app.post('/api/cpa/find-matches', async (req, res) => {
     try {
