@@ -1083,8 +1083,12 @@ app.post('/api/sme-friction-request', async (req, res) => {
             budget_range, additional_context, contact_info
         } = req.body;
 
-        console.log('🎯 New SME Friction Request:', {
+        // Generate session ID for results retrieval
+        const session_id = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        console.log('New SME Friction Request:', {
             request_id,
+            session_id,
             business_type,
             pain_point,
             urgency_level
@@ -1092,31 +1096,30 @@ app.post('/api/sme-friction-request', async (req, res) => {
 
         const result = await dbClient.query(
             `INSERT INTO sme_friction_requests 
-             (request_id, pain_point, business_type, business_size, urgency_level, 
+             (request_id, session_id, pain_point, business_type, business_size, urgency_level, 
               services_needed, time_being_lost, budget_range, additional_context, contact_info, created_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW()) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()) 
              RETURNING *`,
-            [request_id, pain_point, business_type, business_size, urgency_level,
+            [request_id, session_id, pain_point, business_type, business_size, urgency_level,
              services_needed, time_being_lost, budget_range, additional_context, contact_info]
         );
-
-        console.log('✅ SME Friction Request stored:', result.rows[0]);
 
         res.status(201).json({
             success: true,
             message: 'SME friction request submitted successfully',
+            session_id: session_id,
+            results_url: `cpa-matches.html?session=${session_id}`,
             data: result.rows[0],
             next_steps: [
-                'AI analysis of your business needs',
+                'AI analysis of your business needs complete',
                 'Perfect CPA matching in progress', 
-                'You will receive matches within 24 hours',
+                'Click below to view your matches',
                 'Direct contact with top 3 CPA recommendations'
-            ],
-            request_id: request_id
+            ]
         });
 
     } catch (error) {
-        console.error('❌ Error creating SME friction request:', error);
+        console.error('Error creating SME friction request:', error);
         res.status(500).json({
             success: false,
             message: 'Failed to submit friction request',
