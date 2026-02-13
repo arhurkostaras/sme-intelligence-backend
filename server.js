@@ -7,12 +7,36 @@ const cheerio = require('cheerio');
 const { Client } = require('pg');
 const Redis = require('redis');
 const cron = require('node-cron');
+const Stripe = require('stripe');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Initialize Stripe (will be null if STRIPE_SECRET_KEY not set)
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+// Stripe price IDs from environment variables
+const STRIPE_PRICES = {
+    associate_monthly: process.env.STRIPE_PRICE_ASSOCIATE_MONTHLY,
+    associate_yearly: process.env.STRIPE_PRICE_ASSOCIATE_YEARLY,
+    professional_monthly: process.env.STRIPE_PRICE_PROFESSIONAL_MONTHLY,
+    professional_yearly: process.env.STRIPE_PRICE_PROFESSIONAL_YEARLY,
+    enterprise_monthly: process.env.STRIPE_PRICE_ENTERPRISE_MONTHLY,
+    enterprise_yearly: process.env.STRIPE_PRICE_ENTERPRISE_YEARLY,
+};
+
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://canadaaccountants.app';
+
+// --- Stripe webhook route MUST be before express.json() ---
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: [FRONTEND_URL, 'http://localhost:3000', 'http://localhost:5500', 'http://127.0.0.1:5500'],
+    credentials: true,
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Database Configuration
@@ -171,8 +195,47 @@ async function createTables() {
         CREATE INDEX IF NOT EXISTS idx_cpa_profiles_specializations ON cpa_profiles USING GIN(specializations);
         CREATE INDEX IF NOT EXISTS idx_client_preferences_industry ON client_preferences(industry);
         CREATE INDEX IF NOT EXISTS idx_cpa_matches_status ON cpa_matches(status);
+
+        -- Stripe subscription tables
+        CREATE TABLE IF NOT EXISTS cpa_subscriptions (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) NOT NULL,
+            cpa_profile_id VARCHAR(255),
+            stripe_customer_id VARCHAR(255),
+            stripe_subscription_id VARCHAR(255) UNIQUE,
+            tier VARCHAR(50) NOT NULL,
+            billing_interval VARCHAR(20) NOT NULL DEFAULT 'monthly',
+            status VARCHAR(50) NOT NULL DEFAULT 'incomplete',
+            current_period_start TIMESTAMP,
+            current_period_end TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS stripe_transactions (
+            id SERIAL PRIMARY KEY,
+            stripe_payment_intent_id VARCHAR(255),
+            stripe_invoice_id VARCHAR(255),
+            stripe_subscription_id VARCHAR(255),
+            email VARCHAR(255),
+            amount_cents INTEGER NOT NULL,
+            currency VARCHAR(10) NOT NULL DEFAULT 'cad',
+            status VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS webhook_events (
+            id SERIAL PRIMARY KEY,
+            stripe_event_id VARCHAR(255) UNIQUE NOT NULL,
+            event_type VARCHAR(100) NOT NULL,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cpa_subscriptions_email ON cpa_subscriptions(email);
+        CREATE INDEX IF NOT EXISTS idx_cpa_subscriptions_stripe_customer ON cpa_subscriptions(stripe_customer_id);
+        CREATE INDEX IF NOT EXISTS idx_stripe_transactions_subscription ON stripe_transactions(stripe_subscription_id);
     `;
-    
+
     await dbClient.query(createTablesQuery);
 }
 
@@ -1059,6 +1122,309 @@ class CPAMatchingEngine {
     }
 }
 
+// 💳 STRIPE INTEGRATION
+
+// Helper: resolve tier name from Stripe Price ID
+function tierFromPriceId(priceId) {
+    for (const [key, val] of Object.entries(STRIPE_PRICES)) {
+        if (val === priceId) {
+            const parts = key.split('_');
+            return { tier: parts[0], interval: parts[1] };
+        }
+    }
+    return { tier: 'unknown', interval: 'monthly' };
+}
+
+// POST /api/stripe/create-checkout-session
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+
+    try {
+        const { priceId, email, profileId, tier, interval } = req.body;
+
+        if (!priceId || !email) {
+            return res.status(400).json({ error: 'priceId and email are required' });
+        }
+
+        // Resolve actual Stripe price ID from env vars
+        // priceId can be a key like "associate_monthly" or an actual price_xxx ID
+        const resolvedPriceId = STRIPE_PRICES[priceId] || priceId;
+
+        if (!resolvedPriceId || !resolvedPriceId.startsWith('price_')) {
+            return res.status(400).json({ error: `Price not configured for "${priceId}". Please set the corresponding STRIPE_PRICE_* env var.` });
+        }
+
+        const sessionParams = {
+            mode: 'subscription',
+            payment_method_types: ['card'],
+            customer_email: email,
+            line_items: [{ price: resolvedPriceId, quantity: 1 }],
+            success_url: `${FRONTEND_URL}/checkout-success.html?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${FRONTEND_URL}/checkout-cancel.html`,
+            metadata: {
+                email: email,
+                profileId: profileId || '',
+                tier: tier || '',
+                interval: interval || ''
+            },
+            subscription_data: {
+                metadata: {
+                    email: email,
+                    profileId: profileId || '',
+                    tier: tier || '',
+                    interval: interval || ''
+                }
+            }
+        };
+
+        const session = await stripe.checkout.sessions.create(sessionParams);
+
+        res.json({ url: session.url, sessionId: session.id });
+    } catch (error) {
+        console.error('Stripe checkout session error:', error.message);
+        res.status(500).json({ error: 'Failed to create checkout session' });
+    }
+});
+
+// GET /api/stripe/subscription-status
+app.get('/api/stripe/subscription-status', async (req, res) => {
+    try {
+        const { email } = req.query;
+
+        if (!email) {
+            return res.status(400).json({ error: 'email query parameter is required' });
+        }
+
+        const result = await dbClient.query(
+            `SELECT * FROM cpa_subscriptions WHERE email = $1 ORDER BY updated_at DESC LIMIT 1`,
+            [email]
+        );
+
+        if (result.rows.length === 0) {
+            return res.json({ subscription: null });
+        }
+
+        const sub = result.rows[0];
+        res.json({
+            subscription: {
+                tier: sub.tier,
+                interval: sub.billing_interval,
+                status: sub.status,
+                current_period_start: sub.current_period_start,
+                current_period_end: sub.current_period_end,
+                stripe_customer_id: sub.stripe_customer_id,
+                stripe_subscription_id: sub.stripe_subscription_id
+            }
+        });
+    } catch (error) {
+        console.error('Subscription status error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch subscription status' });
+    }
+});
+
+// POST /api/stripe/create-portal-session
+app.post('/api/stripe/create-portal-session', async (req, res) => {
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+
+    try {
+        const { email } = req.body;
+
+        if (!email) {
+            return res.status(400).json({ error: 'email is required' });
+        }
+
+        // Look up Stripe customer ID from our DB
+        const result = await dbClient.query(
+            `SELECT stripe_customer_id FROM cpa_subscriptions WHERE email = $1 AND stripe_customer_id IS NOT NULL ORDER BY updated_at DESC LIMIT 1`,
+            [email]
+        );
+
+        if (result.rows.length === 0 || !result.rows[0].stripe_customer_id) {
+            return res.status(404).json({ error: 'No Stripe customer found for this email' });
+        }
+
+        const portalSession = await stripe.billingPortal.sessions.create({
+            customer: result.rows[0].stripe_customer_id,
+            return_url: `${FRONTEND_URL}/cpa-dashboard.html`
+        });
+
+        res.json({ url: portalSession.url });
+    } catch (error) {
+        console.error('Portal session error:', error.message);
+        res.status(500).json({ error: 'Failed to create portal session' });
+    }
+});
+
+// Stripe Webhook Handler
+async function handleStripeWebhook(req, res) {
+    if (!stripe) return res.status(503).send('Stripe not configured');
+
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+        if (process.env.STRIPE_WEBHOOK_SECRET) {
+            event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+        } else {
+            // In development without webhook secret, parse raw body
+            event = JSON.parse(req.body.toString());
+            console.warn('Warning: STRIPE_WEBHOOK_SECRET not set, skipping signature verification');
+        }
+    } catch (err) {
+        console.error('Webhook signature verification failed:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Idempotency check
+    try {
+        await dbClient.query(
+            `INSERT INTO webhook_events (stripe_event_id, event_type) VALUES ($1, $2)`,
+            [event.id, event.type]
+        );
+    } catch (err) {
+        if (err.code === '23505') {
+            // Duplicate event, already processed
+            console.log(`Webhook event ${event.id} already processed, skipping`);
+            return res.json({ received: true, duplicate: true });
+        }
+        console.error('Webhook idempotency check error:', err.message);
+    }
+
+    console.log(`Stripe webhook received: ${event.type} (${event.id})`);
+
+    try {
+        switch (event.type) {
+            case 'checkout.session.completed':
+                await handleCheckoutCompleted(event.data.object);
+                break;
+            case 'customer.subscription.updated':
+                await handleSubscriptionUpdated(event.data.object);
+                break;
+            case 'customer.subscription.deleted':
+                await handleSubscriptionDeleted(event.data.object);
+                break;
+            case 'invoice.payment_succeeded':
+                await handlePaymentSucceeded(event.data.object);
+                break;
+            case 'invoice.payment_failed':
+                await handlePaymentFailed(event.data.object);
+                break;
+            default:
+                console.log(`Unhandled event type: ${event.type}`);
+        }
+    } catch (err) {
+        console.error(`Error handling ${event.type}:`, err.message);
+    }
+
+    res.json({ received: true });
+}
+
+async function handleCheckoutCompleted(session) {
+    const email = session.customer_email || session.metadata?.email;
+    const customerId = session.customer;
+    const subscriptionId = session.subscription;
+    const profileId = session.metadata?.profileId || null;
+    const tier = session.metadata?.tier || 'unknown';
+    const interval = session.metadata?.interval || 'monthly';
+
+    console.log(`Checkout completed: email=${email}, customer=${customerId}, subscription=${subscriptionId}`);
+
+    // Upsert subscription record
+    await dbClient.query(
+        `INSERT INTO cpa_subscriptions (email, cpa_profile_id, stripe_customer_id, stripe_subscription_id, tier, billing_interval, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active')
+         ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+            email = EXCLUDED.email,
+            stripe_customer_id = EXCLUDED.stripe_customer_id,
+            status = 'active',
+            updated_at = CURRENT_TIMESTAMP`,
+        [email, profileId, customerId, subscriptionId, tier, interval]
+    );
+}
+
+async function handleSubscriptionUpdated(subscription) {
+    const { tier, interval } = tierFromPriceId(subscription.items?.data?.[0]?.price?.id);
+
+    await dbClient.query(
+        `UPDATE cpa_subscriptions SET
+            tier = $1,
+            billing_interval = $2,
+            status = $3,
+            current_period_start = to_timestamp($4),
+            current_period_end = to_timestamp($5),
+            updated_at = CURRENT_TIMESTAMP
+         WHERE stripe_subscription_id = $6`,
+        [
+            tier,
+            interval,
+            subscription.status,
+            subscription.current_period_start,
+            subscription.current_period_end,
+            subscription.id
+        ]
+    );
+
+    console.log(`Subscription updated: ${subscription.id} → ${subscription.status}`);
+}
+
+async function handleSubscriptionDeleted(subscription) {
+    await dbClient.query(
+        `UPDATE cpa_subscriptions SET status = 'canceled', updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = $1`,
+        [subscription.id]
+    );
+    console.log(`Subscription canceled: ${subscription.id}`);
+}
+
+async function handlePaymentSucceeded(invoice) {
+    await dbClient.query(
+        `INSERT INTO stripe_transactions (stripe_payment_intent_id, stripe_invoice_id, stripe_subscription_id, email, amount_cents, currency, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'succeeded')`,
+        [
+            invoice.payment_intent,
+            invoice.id,
+            invoice.subscription,
+            invoice.customer_email,
+            invoice.amount_paid,
+            invoice.currency
+        ]
+    );
+
+    // Ensure subscription is marked active
+    if (invoice.subscription) {
+        await dbClient.query(
+            `UPDATE cpa_subscriptions SET status = 'active', updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = $1`,
+            [invoice.subscription]
+        );
+    }
+
+    console.log(`Payment succeeded: ${invoice.id}, amount=${invoice.amount_paid}`);
+}
+
+async function handlePaymentFailed(invoice) {
+    await dbClient.query(
+        `INSERT INTO stripe_transactions (stripe_payment_intent_id, stripe_invoice_id, stripe_subscription_id, email, amount_cents, currency, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'failed')`,
+        [
+            invoice.payment_intent,
+            invoice.id,
+            invoice.subscription,
+            invoice.customer_email,
+            invoice.amount_due,
+            invoice.currency
+        ]
+    );
+
+    // Mark subscription as past_due
+    if (invoice.subscription) {
+        await dbClient.query(
+            `UPDATE cpa_subscriptions SET status = 'past_due', updated_at = CURRENT_TIMESTAMP WHERE stripe_subscription_id = $1`,
+            [invoice.subscription]
+        );
+    }
+
+    console.log(`Payment failed: ${invoice.id}`);
+}
+
 // 🏛️ API ENDPOINTS
 
 
@@ -1718,7 +2084,11 @@ app.get('/', (req, res) => {
             "GET /health",
             "GET /api/market-intelligence",
             "POST /api/sme-submission",
-            "GET /api/analytics"
+            "GET /api/analytics",
+            "POST /api/stripe/create-checkout-session",
+            "GET /api/stripe/subscription-status",
+            "POST /api/stripe/create-portal-session",
+            "POST /api/stripe/webhook"
         ],
         timestamp: new Date().toISOString()
     });
