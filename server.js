@@ -184,51 +184,76 @@ class StatisticsCanadaAPI {
 
     async getAccountingServicesPriceIndex() {
         try {
-            // Statistics Canada Table: 18-10-0005-01 (Services Producer Price Indexes)
-            const response = await axios.get(`${this.baseUrl}/getFullTableDataByPid/1810000501`);
-            
-            console.log('📊 Statistics Canada - Accounting Services data retrieved');
-            return this.parseStatCanData(response.data, 'accounting_services_index');
+            // StatCan vectors: CPI All-items (41690973), CPI Services (41691339)
+            const response = await axios.post(
+                `${this.baseUrl}/getDataFromVectorsAndLatestNPeriods`,
+                [
+                    { vectorId: 41690973, latestN: 6 },
+                    { vectorId: 41691339, latestN: 6 }
+                ],
+                { headers: { 'Content-Type': 'application/json' } }
+            );
+
+            const parsedData = [];
+            const labels = { 41690973: 'CPI All-items', 41691339: 'CPI Services' };
+
+            for (const series of response.data) {
+                if (series.status === 'SUCCESS') {
+                    const vid = series.object.vectorId;
+                    for (const point of series.object.vectorDataPoint) {
+                        if (point.value !== null) {
+                            parsedData.push({
+                                source: 'Statistics Canada',
+                                metric_name: labels[vid] || `Vector ${vid}`,
+                                metric_value: point.value,
+                                province: 'Canada',
+                                industry: 'Accounting Services'
+                            });
+                        }
+                    }
+                }
+            }
+
+            console.log(`📊 Statistics Canada - ${parsedData.length} CPI data points retrieved`);
+            return parsedData;
         } catch (error) {
             console.error('❌ Statistics Canada API error:', error.message);
-            return null;
+            return [];
         }
     }
 
     async getAdvancedTechnologySurvey() {
         try {
-            // Statistics Canada Advanced Technology Survey data
-            const response = await axios.get(`${this.baseUrl}/getChangedSurveyData/5555`);
-            
-            console.log('🔬 Statistics Canada - Advanced Technology Survey retrieved');
-            return this.parseStatCanData(response.data, 'technology_adoption');
-        } catch (error) {
-            console.error('❌ Advanced Technology Survey error:', error.message);
-            return null;
-        }
-    }
+            // StatCan vector 111666224: CAD/USD exchange rate (business indicator)
+            const response = await axios.post(
+                `${this.baseUrl}/getDataFromVectorsAndLatestNPeriods`,
+                [{ vectorId: 111666224, latestN: 10 }],
+                { headers: { 'Content-Type': 'application/json' } }
+            );
 
-    parseStatCanData(data, metricType) {
-        // Parse Statistics Canada JSON format
-        const parsedData = [];
-        
-        if (data && data.object && data.object.dimension) {
-            const observations = data.object.observation;
-            const dimensions = data.object.dimension;
-            
-            for (const [key, value] of Object.entries(observations)) {
-                if (value && value.value) {
-                    parsedData.push({
-                        metric_type: metricType,
-                        value: parseFloat(value.value),
-                        period: key,
-                        source: 'Statistics Canada'
-                    });
+            const parsedData = [];
+            for (const series of response.data) {
+                if (series.status === 'SUCCESS') {
+                    for (const point of series.object.vectorDataPoint) {
+                        if (point.value !== null) {
+                            parsedData.push({
+                                source: 'Statistics Canada',
+                                metric_name: 'CAD/USD Exchange Rate',
+                                metric_value: point.value,
+                                province: 'Canada',
+                                industry: 'Business Indicators'
+                            });
+                        }
+                    }
                 }
             }
+
+            console.log(`🔬 Statistics Canada - ${parsedData.length} exchange rate data points retrieved`);
+            return parsedData;
+        } catch (error) {
+            console.error('❌ Statistics Canada business indicators error:', error.message);
+            return [];
         }
-        
-        return parsedData;
     }
 }
 
@@ -279,33 +304,39 @@ class ISEDCanadaAPI {
 
 // 📊 INDUSTRY REPORT SCRAPERS
 class IndustryReportScraper {
-    async getCWBankResearch() {
+    async getBDCResearch() {
         try {
-            const response = await axios.get('https://www.cwbank.ca/en/resources/small-business', {
+            const response = await axios.get('https://www.bdc.ca/en/about/analysis-research', {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (compatible; SME-Intelligence-Bot/1.0)'
-                }
+                },
+                timeout: 15000
             });
-            
+
             const $ = cheerio.load(response.data);
             const insights = [];
-            
-            // Look for cash flow statistics
-            $('.research-finding').each((index, element) => {
-                const finding = $(element).text();
-                if (finding.includes('cash flow') || finding.includes('SME')) {
+
+            // Extract research findings from BDC analysis page
+            $('h3, .card-title, .research-title, .article-title').each((index, element) => {
+                const finding = $(element).text().trim();
+                if (finding && (finding.includes('business') || finding.includes('SME') ||
+                    finding.includes('entrepreneur') || finding.includes('growth') ||
+                    finding.includes('economy') || finding.includes('small'))) {
                     insights.push({
-                        source: 'CW Bank Research',
-                        finding: finding.trim(),
+                        source: 'BDC Research',
+                        metric_name: finding.substring(0, 200),
+                        metric_value: null,
+                        province: 'Canada',
+                        industry: 'SME Research',
                         collection_date: new Date()
                     });
                 }
             });
 
-            console.log('🏦 CW Bank - SME Research data retrieved');
+            console.log(`🏦 BDC - ${insights.length} SME research insights retrieved`);
             return insights;
         } catch (error) {
-            console.error('❌ CW Bank scraping error:', error.message);
+            console.error('❌ BDC scraping error:', error.message);
             return [];
         }
     }
@@ -365,7 +396,7 @@ try {
         this.statCanAPI.getAccountingServicesPriceIndex(),
         this.statCanAPI.getAdvancedTechnologySurvey(), 
         this.isedAPI.getSMEInnovationData(),
-        this.industryScraper.getCWBankResearch(),
+        this.industryScraper.getBDCResearch(),
         this.industryScraper.getRobertHalfSalaryData()
     ]);
 
