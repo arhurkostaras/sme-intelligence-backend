@@ -26,6 +26,10 @@ const redisClient = Redis.createClient({
     url: process.env.REDIS_PRIVATE_URL || process.env.REDIS_URL || 'redis://localhost:6379'
 });
 
+redisClient.on('error', (err) => {
+    console.error('⚠️ Redis client error:', err.message);
+});
+
 // Initialize Database Connection
 async function initializeDatabase() {
     try {
@@ -1660,6 +1664,19 @@ cron.schedule('0 6 * * *', async () => {
     await dataOrchestrator.collectAllData();
 });
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'OK',
+        message: 'SME Intelligence Backend is running',
+        timestamp: new Date().toISOString(),
+        services: {
+            database: dbClient._connected ? 'connected' : 'disconnected',
+            redis: redisClient.isOpen ? 'connected' : 'disconnected'
+        }
+    });
+});
+
 // Root endpoint - Welcome message
 app.get('/', (req, res) => {
     res.json({
@@ -1667,8 +1684,9 @@ app.get('/', (req, res) => {
         status: "operational",
         version: "1.0.0",
         endpoints: [
+            "GET /health",
             "GET /api/market-intelligence",
-            "POST /api/sme-submission", 
+            "POST /api/sme-submission",
             "GET /api/analytics"
         ],
         timestamp: new Date().toISOString()
@@ -1700,38 +1718,62 @@ app.get('/api/debug/check-data', async (req, res) => {
 });
 
 // 🚀 START SERVER
-// 🚀 START SERVER
 async function startServer() {
+    // Initialize database (non-fatal if it fails)
     await initializeDatabase();
-    await redisClient.connect();
-    
-    // Start HTTP server FIRST
+
+    // Connect to Redis (non-fatal if it fails)
+    try {
+        await redisClient.connect();
+        console.log('✅ Redis connected successfully');
+    } catch (error) {
+        console.error('⚠️ Redis connection failed (non-fatal):', error.message);
+    }
+
+    // Start HTTP server FIRST so healthchecks pass
     app.listen(PORT, () => {
         console.log(`🚀 Real-Time SME Intelligence Server running on port ${PORT}`);
         console.log(`📊 API endpoints:`);
+        console.log(`   GET  /health`);
         console.log(`   GET  /api/market-intelligence`);
         console.log(`   POST /api/sme-submission`);
         console.log(`   GET  /api/analytics`);
     });
-    
-    // Then do data collection in background
-    // Initial data collection
-console.log('🔄 Running initial data collection...');
-await dataOrchestrator.collectAllData();
 
-// Schedule data collection every 24 hours
-console.log('⏰ Setting up 24-hour automated data collection...');
-setInterval(async () => {
-    console.log('🔄 Running scheduled 24-hour data collection...');
-    try {
-        await dataOrchestrator.collectAllData();
-        console.log('✅ Scheduled data collection completed successfully');
-    } catch (error) {
-        console.error('❌ Scheduled data collection failed:', error);
-    }
-}, 24 * 60 * 60 * 1000); // 24 hours in milliseconds
+    // Run initial data collection in background (non-blocking, non-fatal)
+    setTimeout(async () => {
+        try {
+            console.log('🔄 Running initial data collection...');
+            await dataOrchestrator.collectAllData();
+            console.log('✅ Initial data collection completed');
+        } catch (error) {
+            console.error('⚠️ Initial data collection failed (non-fatal):', error.message);
+        }
+    }, 5000);
 
-console.log('✅ 24-hour data collection scheduler activated');
+    // Schedule data collection every 24 hours
+    setInterval(async () => {
+        console.log('🔄 Running scheduled 24-hour data collection...');
+        try {
+            await dataOrchestrator.collectAllData();
+            console.log('✅ Scheduled data collection completed successfully');
+        } catch (error) {
+            console.error('❌ Scheduled data collection failed:', error.message);
+        }
+    }, 24 * 60 * 60 * 1000);
+
+    console.log('✅ 24-hour data collection scheduler activated');
 }
 
-startServer().catch(console.error);
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    console.log('🛑 SIGTERM received, shutting down gracefully...');
+    try { await dbClient.end(); } catch (e) { /* ignore */ }
+    try { await redisClient.quit(); } catch (e) { /* ignore */ }
+    process.exit(0);
+});
+
+startServer().catch((error) => {
+    console.error('❌ Server startup failed:', error);
+    process.exit(1);
+});
