@@ -8,6 +8,7 @@ const { Client } = require('pg');
 const Redis = require('redis');
 const cron = require('node-cron');
 const Stripe = require('stripe');
+const { sendSubscriptionConfirmation, sendPaymentReceipt, sendPaymentFailedAlert } = require('./services/email');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1340,6 +1341,11 @@ async function handleCheckoutCompleted(session) {
             updated_at = CURRENT_TIMESTAMP`,
         [email, profileId, customerId, subscriptionId, tier, interval]
     );
+
+    // Send subscription confirmation email
+    sendSubscriptionConfirmation({ email, tier, interval }).catch(err => {
+        console.error('Subscription email error (non-fatal):', err.message);
+    });
 }
 
 async function handleSubscriptionUpdated(subscription) {
@@ -1398,6 +1404,16 @@ async function handlePaymentSucceeded(invoice) {
     }
 
     console.log(`Payment succeeded: ${invoice.id}, amount=${invoice.amount_paid}`);
+
+    // Send payment receipt email
+    sendPaymentReceipt({
+        email: invoice.customer_email,
+        amount: invoice.amount_paid,
+        currency: invoice.currency,
+        invoiceId: invoice.id,
+    }).catch(err => {
+        console.error('Payment receipt email error (non-fatal):', err.message);
+    });
 }
 
 async function handlePaymentFailed(invoice) {
@@ -1423,6 +1439,16 @@ async function handlePaymentFailed(invoice) {
     }
 
     console.log(`Payment failed: ${invoice.id}`);
+
+    // Send payment failed alert
+    sendPaymentFailedAlert({
+        email: invoice.customer_email,
+        amount: invoice.amount_due,
+        currency: invoice.currency,
+        invoiceId: invoice.id,
+    }).catch(err => {
+        console.error('Payment failed email error (non-fatal):', err.message);
+    });
 }
 
 // 🏛️ API ENDPOINTS
