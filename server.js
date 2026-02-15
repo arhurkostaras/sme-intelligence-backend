@@ -1,5 +1,6 @@
 // server.js - Real-Time SME Intelligence Backend
 // Complete Node.js server for Canadian SME intelligence data collection
+const Sentry = require('@sentry/node');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -9,6 +10,15 @@ const Redis = require('redis');
 const cron = require('node-cron');
 const Stripe = require('stripe');
 const { sendSubscriptionConfirmation, sendPaymentReceipt, sendPaymentFailedAlert } = require('./services/email');
+
+// Initialize Sentry before anything else
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || 'production',
+    tracesSampleRate: 0.2,
+  });
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -30,6 +40,11 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://canadaaccountants.app'
 
 // --- Stripe webhook route MUST be before express.json() ---
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+
+// Sentry request handler (must be before other middleware, but after Stripe raw webhook)
+if (process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.requestHandler());
+}
 
 // Middleware
 app.use(cors({
@@ -2190,6 +2205,11 @@ async function startServer() {
     }, 24 * 60 * 60 * 1000);
 
     console.log('✅ 24-hour data collection scheduler activated');
+}
+
+// Sentry error handler (must be after all routes)
+if (process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.errorHandler());
 }
 
 // Graceful shutdown

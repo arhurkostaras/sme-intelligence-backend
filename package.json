@@ -10,6 +10,7 @@
     "deploy": "railway deploy"
   },
   "dependencies": {
+    "@sentry/node": "^10.38.0",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0-rc.12",
     "cors": "^2.8.5",
