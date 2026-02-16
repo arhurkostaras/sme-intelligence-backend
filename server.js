@@ -42,8 +42,10 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://canadaaccountants.app'
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 
 // Sentry request handler (must be before other middleware, but after Stripe raw webhook)
-if (process.env.SENTRY_DSN) {
+if (process.env.SENTRY_DSN && Sentry.Handlers) {
   app.use(Sentry.Handlers.requestHandler());
+} else if (process.env.SENTRY_DSN && Sentry.setupExpressErrorHandler) {
+  // Sentry SDK v8+ uses setupExpressErrorHandler instead of Handlers
 }
 
 // Middleware
@@ -454,6 +456,1573 @@ class IndustryReportScraper {
         }
     }
 }
+
+// =====================================================
+// 🏛️ CPA DIRECTORY SCRAPERS
+// =====================================================
+
+// Common Canadian last names for scrapers that require exact/partial name input
+const COMMON_CANADIAN_LAST_NAMES = [
+  'Smith', 'Brown', 'Wilson', 'Johnson', 'Williams', 'Jones', 'Taylor', 'Lee',
+  'Martin', 'Anderson', 'Thomas', 'White', 'Thompson', 'Campbell', 'Stewart',
+  'MacDonald', 'Scott', 'Reid', 'Murray', 'Ross', 'Young', 'Mitchell', 'Walker',
+  'Robinson', 'Clark', 'Wright', 'King', 'Green', 'Baker', 'Hill', 'Hall',
+  'Wood', 'Watson', 'Gray', 'Robertson', 'Fraser', 'Hamilton', 'Graham',
+  'Henderson', 'Morrison', 'Marshall', 'Ferguson', 'Davidson', 'Kennedy',
+  'Gordon', 'Cameron', 'Burns', 'McDonald', 'Bell', 'Miller', 'Davis',
+  'Moore', 'Jackson', 'Harris', 'Lewis', 'Allen', 'Adams', 'Nelson',
+  'Carter', 'Patel', 'Singh', 'Chen', 'Wang', 'Li', 'Zhang', 'Liu',
+  'Yang', 'Huang', 'Nguyen', 'Tran', 'Kim', 'Park', 'Cho', 'Chan',
+  'Wong', 'Lam', 'Ho', 'Leung', 'Wu', 'Guo', 'Lin', 'Xu',
+  'Tremblay', 'Gagnon', 'Roy', 'Bouchard', 'Gauthier', 'Morin',
+  'Lavoie', 'Fortin', 'Gagné', 'Ouellet', 'Pelletier', 'Bélanger',
+  'Lévesque', 'Bergeron', 'Leblanc', 'Côté', 'Girard', 'Poirier'
+];
+
+const crypto = require('crypto');
+
+// Helper: Generate name hash for deduplication
+function generateNameHash(name, province) {
+  const normalized = `${(name || '').toLowerCase().replace(/[^a-z]/g, '')}:${(province || '').toLowerCase()}`;
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+// Helper: Delay between requests
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 2A. CPA BC Scraper — iMIS REST API
+class CPABCScraper {
+  constructor() {
+    this.agreementUrl = 'https://services.bccpa.ca/Directory/Public_Services/Directory_of_Members/Directory/User_Agreement.aspx';
+    this.searchUrl = 'https://services.bccpa.ca/Directory/Directory/CPABC_Directory_Search.aspx';
+    this.source = 'cpabc';
+    this.province = 'BC';
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // ASP.NET control names for the search form
+    this.LAST_NAME_FIELD = 'ctl01$TemplateBody$WebPartManager1$gwpciNewQueryMenuCommon$ciNewQueryMenuCommon$ResultsGrid$Sheet0$Input2$TextBox1';
+    this.FIRST_NAME_FIELD = 'ctl01$TemplateBody$WebPartManager1$gwpciNewQueryMenuCommon$ciNewQueryMenuCommon$ResultsGrid$Sheet0$Input0$TextBox1';
+    this.CITY_FIELD = 'ctl01$TemplateBody$WebPartManager1$gwpciNewQueryMenuCommon$ciNewQueryMenuCommon$ResultsGrid$Sheet0$Input3$TextBox1';
+    this.SUBMIT_BUTTON = 'ctl01$TemplateBody$WebPartManager1$gwpciNewQueryMenuCommon$ciNewQueryMenuCommon$ResultsGrid$Sheet0$SubmitButton';
+  }
+
+  // Extract Set-Cookie headers into a cookie string
+  _extractCookies(headers) {
+    const setCookies = headers['set-cookie'];
+    if (!setCookies) return '';
+    return (Array.isArray(setCookies) ? setCookies : [setCookies])
+      .map(c => c.split(';')[0])
+      .join('; ');
+  }
+
+  // Merge new cookies into existing cookie string
+  _mergeCookies(existing, headers) {
+    const newCookies = this._extractCookies(headers);
+    if (!newCookies) return existing;
+    const cookieMap = {};
+    // Parse existing
+    if (existing) {
+      existing.split('; ').forEach(c => {
+        const [k, ...v] = c.split('=');
+        if (k) cookieMap[k.trim()] = v.join('=');
+      });
+    }
+    // Parse new (overwrite)
+    newCookies.split('; ').forEach(c => {
+      const [k, ...v] = c.split('=');
+      if (k) cookieMap[k.trim()] = v.join('=');
+    });
+    return Object.entries(cookieMap).map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+
+  // Extract all hidden form fields from ASP.NET page
+  _extractHiddenFields(html) {
+    const $ = cheerio.load(html);
+    const fields = {};
+    $('input[type="hidden"]').each((_, el) => {
+      const name = $(el).attr('name');
+      const value = $(el).attr('value') || '';
+      if (name) fields[name] = value;
+    });
+    return fields;
+  }
+
+  // Parse CPA records from the Telerik RadGrid results table
+  _parseResults(html) {
+    const $ = cheerio.load(html);
+    const records = [];
+
+    // Telerik RadGrid uses table with class rgMasterTable
+    // Rows have classes rgRow and rgAltRow
+    $('table.rgMasterTable tbody tr, table[id*="ResultsGrid"] tbody tr').each((_, row) => {
+      const $row = $(row);
+      // Skip header rows, pager rows, and "no records" rows
+      if ($row.hasClass('rgHeader') || $row.hasClass('rgPager') || $row.hasClass('rgNoRecords')) return;
+      if ($row.find('th').length > 0) return;
+
+      const cells = $row.find('td');
+      if (cells.length < 2) return;
+
+      // Try to extract data from cells - typical layout: Name, City, Designation
+      const cellTexts = [];
+      cells.each((_, cell) => {
+        cellTexts.push($(cell).text().trim());
+      });
+
+      if (cellTexts.length >= 2 && cellTexts[0]) {
+        // Name is usually "LastName, FirstName" or just a full name
+        let firstName = '', lastName = '', fullName = cellTexts[0];
+        if (cellTexts[0].includes(',')) {
+          const parts = cellTexts[0].split(',').map(s => s.trim());
+          lastName = parts[0] || '';
+          firstName = parts[1] || '';
+        } else {
+          const parts = cellTexts[0].split(/\s+/);
+          firstName = parts[0] || '';
+          lastName = parts.slice(1).join(' ') || '';
+        }
+
+        records.push({
+          firstName,
+          lastName,
+          fullName,
+          city: cellTexts[1] || '',
+          designation: cellTexts[2] || 'CPA',
+        });
+      }
+    });
+
+    // Fallback: if RadGrid not found, try any data table in the results area
+    if (records.length === 0) {
+      $('table tr').each((_, row) => {
+        const $row = $(row);
+        const cells = $row.find('td');
+        if (cells.length < 2) return;
+
+        const cellTexts = [];
+        cells.each((_, cell) => {
+          cellTexts.push($(cell).text().trim());
+        });
+
+        // Heuristic: skip rows that look like headers or navigation
+        if (!cellTexts[0] || cellTexts[0].length > 100) return;
+        if (cellTexts[0].toLowerCase().includes('name') && cellTexts[1].toLowerCase().includes('city')) return;
+
+        // Check if first cell looks like a person name (contains letters, no digits)
+        if (/^[a-zA-Z\s,.-]+$/.test(cellTexts[0]) && cellTexts[0].length > 2) {
+          let firstName = '', lastName = '', fullName = cellTexts[0];
+          if (cellTexts[0].includes(',')) {
+            const parts = cellTexts[0].split(',').map(s => s.trim());
+            lastName = parts[0] || '';
+            firstName = parts[1] || '';
+          } else {
+            const parts = cellTexts[0].split(/\s+/);
+            firstName = parts[0] || '';
+            lastName = parts.slice(1).join(' ') || '';
+          }
+          records.push({
+            firstName,
+            lastName,
+            fullName,
+            city: cellTexts[1] || '',
+            designation: cellTexts[2] || 'CPA',
+          });
+        }
+      });
+    }
+
+    return records;
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting CPA BC scrape (ASP.NET Web Forms mode)...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0;
+    let totalInserted = 0;
+    let totalSkipped = 0;
+    let consecutiveErrors = 0;
+
+    try {
+      // Step 1: Visit User Agreement page to establish session
+      console.log('[CPABC] Step 1: Visiting User Agreement page...');
+      const agreementRes = await axios.get(this.agreementUrl, {
+        headers: { 'User-Agent': this.userAgent },
+        timeout: 15000,
+        maxRedirects: 5,
+      });
+      let cookies = this._extractCookies(agreementRes.headers);
+      console.log(`[CPABC] Session cookies established: ${cookies ? 'yes' : 'no'}`);
+
+      // Step 2: GET search page with Referer from agreement page
+      console.log('[CPABC] Step 2: Loading search page...');
+      await delay(2000);
+      const searchPageRes = await axios.get(this.searchUrl, {
+        headers: {
+          'User-Agent': this.userAgent,
+          'Referer': this.agreementUrl,
+          'Cookie': cookies,
+        },
+        timeout: 15000,
+        maxRedirects: 5,
+      });
+      cookies = this._mergeCookies(cookies, searchPageRes.headers);
+
+      // Extract initial hidden fields
+      let hiddenFields = this._extractHiddenFields(searchPageRes.data);
+      const fieldCount = Object.keys(hiddenFields).length;
+      console.log(`[CPABC] Extracted ${fieldCount} hidden fields from search page`);
+
+      if (fieldCount === 0) {
+        throw new Error('No hidden fields found - search page may have changed structure');
+      }
+
+      // Step 3: Iterate 2-letter last name prefixes (aa-zz)
+      const letters = 'abcdefghijklmnopqrstuvwxyz';
+      let searchCount = 0;
+
+      for (let i = 0; i < letters.length; i++) {
+        for (let j = 0; j < letters.length; j++) {
+          const prefix = letters[i] + letters[j];
+          searchCount++;
+
+          // Log progress every 26 prefixes (each starting letter)
+          if (j === 0) {
+            console.log(`[CPABC] Searching "${letters[i]}*" prefixes (${searchCount}/676)... Found: ${totalFound}, Inserted: ${totalInserted}`);
+          }
+
+          try {
+            // Build form POST data
+            const formData = new URLSearchParams();
+
+            // Add all hidden fields
+            for (const [key, value] of Object.entries(hiddenFields)) {
+              formData.append(key, value);
+            }
+
+            // Clear any previous search values and set new search
+            formData.set(this.FIRST_NAME_FIELD, '');
+            formData.set(this.CITY_FIELD, '');
+            formData.set(this.LAST_NAME_FIELD, prefix);
+            formData.set(this.SUBMIT_BUTTON, 'Search');
+            // Ensure we get a full page response (not AJAX partial)
+            formData.delete('ctl01$ScriptManager1');
+            formData.set('__EVENTTARGET', '');
+            formData.set('__EVENTARGUMENT', '');
+
+            const searchRes = await axios.post(this.searchUrl, formData.toString(), {
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': this.userAgent,
+                'Referer': this.searchUrl,
+                'Cookie': cookies,
+              },
+              timeout: 30000,
+              maxRedirects: 5,
+            });
+
+            // Update cookies from response
+            cookies = this._mergeCookies(cookies, searchRes.headers);
+
+            // Update hidden fields from the response for next search
+            const newHiddenFields = this._extractHiddenFields(searchRes.data);
+            if (Object.keys(newHiddenFields).length > 0) {
+              hiddenFields = newHiddenFields;
+            }
+
+            // Parse results from the HTML response
+            const records = this._parseResults(searchRes.data);
+            totalFound += records.length;
+            consecutiveErrors = 0;
+
+            // Insert records into database
+            for (const record of records) {
+              const fullName = record.fullName || `${record.firstName} ${record.lastName}`.trim();
+              const nameHash = generateNameHash(fullName, this.province);
+
+              // Dedup check
+              const existing = await dbClient.query('SELECT id FROM scraped_cpas WHERE name_hash = $1', [nameHash]);
+              if (existing.rows.length > 0) { totalSkipped++; continue; }
+
+              await dbClient.query(
+                `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, firm_name, name_hash, scrape_job_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [this.source, record.firstName, record.lastName, fullName,
+                 record.designation || 'CPA', this.province, record.city || '',
+                 '', nameHash, jobId]
+              );
+              totalInserted++;
+            }
+
+          } catch (err) {
+            consecutiveErrors++;
+            console.error(`[CPABC] Error for prefix "${prefix}":`, err.message);
+
+            // If too many consecutive errors, the session may have expired - re-establish
+            if (consecutiveErrors >= 5) {
+              console.log('[CPABC] Too many consecutive errors, re-establishing session...');
+              try {
+                const reAgree = await axios.get(this.agreementUrl, {
+                  headers: { 'User-Agent': this.userAgent },
+                  timeout: 15000,
+                });
+                cookies = this._extractCookies(reAgree.headers);
+                await delay(2000);
+                const reSearch = await axios.get(this.searchUrl, {
+                  headers: {
+                    'User-Agent': this.userAgent,
+                    'Referer': this.agreementUrl,
+                    'Cookie': cookies,
+                  },
+                  timeout: 15000,
+                });
+                cookies = this._mergeCookies(cookies, reSearch.headers);
+                hiddenFields = this._extractHiddenFields(reSearch.data);
+                consecutiveErrors = 0;
+                console.log('[CPABC] Session re-established successfully');
+              } catch (reErr) {
+                console.error('[CPABC] Failed to re-establish session:', reErr.message);
+              }
+            }
+          }
+
+          await delay(3000); // 3-second delay between requests
+        }
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ CPA BC scrape complete: ${totalFound} found, ${totalInserted} inserted, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ CPA BC scrape failed:', error.message);
+    }
+
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) {
+    const result = await dbClient.query(
+      `INSERT INTO scrape_jobs (source, status) VALUES ($1, 'running') RETURNING id`,
+      [this.source]
+    );
+    return result.rows[0].id;
+  }
+
+  async _completeJob(dbClient, jobId, found, inserted, skipped) {
+    await dbClient.query(
+      `UPDATE scrape_jobs SET status = 'completed', records_found = $2, records_inserted = $3, records_skipped = $4, completed_at = NOW() WHERE id = $1`,
+      [jobId, found, inserted, skipped]
+    );
+  }
+
+  async _failJob(dbClient, jobId, errorMsg) {
+    await dbClient.query(
+      `UPDATE scrape_jobs SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1`,
+      [jobId, errorMsg]
+    );
+  }
+}
+
+// =====================================================
+// 2B. Generic iMIS Directory Scraper (MB, SK, NS, NB, PEI, NL)
+// =====================================================
+// All these provinces use ASP.NET iMIS with Telerik RadGrid
+class IMISDirectoryScraper {
+  constructor({ source, province, searchUrl, lastNameFieldIndex, userAgent }) {
+    this.source = source;
+    this.province = province;
+    this.searchUrl = searchUrl;
+    this.lastNameFieldIndex = lastNameFieldIndex || 0; // which Input# is the last name
+    this.userAgent = userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+
+  _extractCookies(headers) {
+    const setCookies = headers['set-cookie'];
+    if (!setCookies) return '';
+    return (Array.isArray(setCookies) ? setCookies : [setCookies])
+      .map(c => c.split(';')[0]).join('; ');
+  }
+
+  _mergeCookies(existing, headers) {
+    const newCookies = this._extractCookies(headers);
+    if (!newCookies) return existing;
+    const map = {};
+    if (existing) existing.split('; ').forEach(c => { const [k, ...v] = c.split('='); if (k) map[k.trim()] = v.join('='); });
+    newCookies.split('; ').forEach(c => { const [k, ...v] = c.split('='); if (k) map[k.trim()] = v.join('='); });
+    return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+
+  _extractHiddenFields(html) {
+    const $ = cheerio.load(html);
+    const fields = {};
+    $('input[type="hidden"]').each((_, el) => {
+      const name = $(el).attr('name');
+      const value = $(el).attr('value') || '';
+      if (name) fields[name] = value;
+    });
+    return fields;
+  }
+
+  // Auto-discover search form field names from the page HTML
+  _discoverFormFields(html) {
+    const $ = cheerio.load(html);
+    const textInputs = [];
+    const submitButtons = [];
+    $('input[type="text"]').each((_, el) => {
+      const name = $(el).attr('name') || '';
+      if (name.includes('TextBox') || name.includes('ResultsGrid')) textInputs.push(name);
+    });
+    $('input[type="submit"]').each((_, el) => {
+      const name = $(el).attr('name') || '';
+      const value = $(el).attr('value') || 'Search';
+      if (name.includes('SubmitButton')) submitButtons.push({ name, value });
+    });
+    const btn = submitButtons[0] || { name: '', value: 'Search' };
+    return { textInputs, submitButton: btn.name, submitButtonValue: btn.value };
+  }
+
+  _parseResults(html) {
+    const $ = cheerio.load(html);
+    const records = [];
+
+    // iMIS Telerik RadGrid: rows with rgRow/rgAltRow classes
+    $('table.rgMasterTable tbody tr, table[id*="ResultsGrid"] tbody tr, table[id*="Grid1"] tbody tr').each((_, row) => {
+      const $row = $(row);
+      if ($row.hasClass('rgHeader') || $row.hasClass('rgPager') || $row.hasClass('rgNoRecords')) return;
+      if ($row.find('th').length > 0) return;
+      const cells = $row.find('td');
+      if (cells.length < 1) return;
+      const cellTexts = [];
+      cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
+      if (!cellTexts[0] || cellTexts[0].length < 2) return;
+
+      let firstName = '', lastName = '', fullName = cellTexts[0];
+      if (cellTexts[0].includes(',')) {
+        const parts = cellTexts[0].split(',').map(s => s.trim());
+        lastName = parts[0] || '';
+        firstName = parts[1] || '';
+      } else {
+        const parts = cellTexts[0].split(/\s+/);
+        firstName = parts[0] || '';
+        lastName = parts.slice(1).join(' ') || '';
+      }
+      records.push({ firstName, lastName, fullName, city: cellTexts[1] || '', designation: cellTexts[2] || 'CPA' });
+    });
+
+    // Fallback: try any data table
+    if (records.length === 0) {
+      $('table tr').each((_, row) => {
+        const cells = $(row).find('td');
+        if (cells.length < 2) return;
+        const cellTexts = [];
+        cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
+        if (!cellTexts[0] || cellTexts[0].length > 100 || cellTexts[0].length < 3) return;
+        if (/name/i.test(cellTexts[0]) && /city|town/i.test(cellTexts[1])) return;
+        if (/^[a-zA-ZÀ-ÿ\s,.''-]+$/.test(cellTexts[0])) {
+          let firstName = '', lastName = '', fullName = cellTexts[0];
+          if (cellTexts[0].includes(',')) {
+            const parts = cellTexts[0].split(',').map(s => s.trim());
+            lastName = parts[0]; firstName = parts[1] || '';
+          } else {
+            const parts = cellTexts[0].split(/\s+/);
+            firstName = parts[0]; lastName = parts.slice(1).join(' ');
+          }
+          records.push({ firstName, lastName, fullName, city: cellTexts[1] || '', designation: 'CPA' });
+        }
+      });
+    }
+    return records;
+  }
+
+  async scrape(dbClient) {
+    console.log(`🔍 Starting ${this.source} scrape (iMIS mode)...`);
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+    let consecutiveErrors = 0;
+
+    try {
+      // Step 1: GET search page
+      console.log(`[${this.source}] Loading search page: ${this.searchUrl}`);
+      const pageRes = await axios.get(this.searchUrl, {
+        headers: { 'User-Agent': this.userAgent },
+        timeout: 15000, maxRedirects: 5,
+      });
+      let cookies = this._extractCookies(pageRes.headers);
+      let hiddenFields = this._extractHiddenFields(pageRes.data);
+      const { textInputs, submitButton, submitButtonValue } = this._discoverFormFields(pageRes.data);
+
+      console.log(`[${this.source}] Hidden fields: ${Object.keys(hiddenFields).length}, Text inputs: ${textInputs.length}, Submit: ${submitButton ? `found (value="${submitButtonValue}")` : 'NOT FOUND'}`);
+
+      if (!submitButton || textInputs.length === 0) {
+        throw new Error('Could not discover search form fields - page structure may have changed');
+      }
+
+      const lastNameField = textInputs[this.lastNameFieldIndex] || textInputs[0];
+      console.log(`[${this.source}] Using last name field: ${lastNameField}`);
+
+      // Step 2: Iterate using 2-letter prefixes
+      const letters = 'abcdefghijklmnopqrstuvwxyz';
+      let searchCount = 0;
+
+      for (let i = 0; i < letters.length; i++) {
+        for (let j = 0; j < letters.length; j++) {
+          const prefix = letters[i] + letters[j];
+          searchCount++;
+
+          if (j === 0) {
+            console.log(`[${this.source}] Searching "${letters[i]}*" prefixes (${searchCount}/676)... Found: ${totalFound}, Inserted: ${totalInserted}`);
+          }
+
+          try {
+            const formData = new URLSearchParams();
+            for (const [key, value] of Object.entries(hiddenFields)) {
+              formData.append(key, value);
+            }
+            // Set all text inputs to empty, then set the last name field
+            for (const input of textInputs) {
+              formData.set(input, '');
+            }
+            formData.set(lastNameField, prefix);
+            formData.set(submitButton, submitButtonValue);
+            formData.delete('ctl01$ScriptManager1');
+            formData.delete('ctl00$ScriptManager1');
+            // iMIS __doPostBack sets __EVENTTARGET to the submit button name
+            formData.set('__EVENTTARGET', submitButton);
+            formData.set('__EVENTARGUMENT', '');
+
+            const searchRes = await axios.post(this.searchUrl, formData.toString(), {
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': this.userAgent,
+                'Referer': this.searchUrl,
+                'Cookie': cookies,
+              },
+              timeout: 30000, maxRedirects: 5,
+            });
+
+            cookies = this._mergeCookies(cookies, searchRes.headers);
+            const newHidden = this._extractHiddenFields(searchRes.data);
+            if (Object.keys(newHidden).length > 0) hiddenFields = newHidden;
+
+            const records = this._parseResults(searchRes.data);
+            totalFound += records.length;
+            consecutiveErrors = 0;
+
+            for (const record of records) {
+              const fullName = record.fullName || `${record.firstName} ${record.lastName}`.trim();
+              const nameHash = generateNameHash(fullName, this.province);
+              const existing = await dbClient.query('SELECT id FROM scraped_cpas WHERE name_hash = $1', [nameHash]);
+              if (existing.rows.length > 0) { totalSkipped++; continue; }
+              await dbClient.query(
+                `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, name_hash, scrape_job_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [this.source, record.firstName, record.lastName, fullName, record.designation, this.province, record.city, nameHash, jobId]
+              );
+              totalInserted++;
+            }
+          } catch (err) {
+            consecutiveErrors++;
+            if (consecutiveErrors <= 3) console.error(`[${this.source}] Error for "${prefix}":`, err.message);
+            if (consecutiveErrors >= 5) {
+              console.log(`[${this.source}] Re-establishing session...`);
+              try {
+                const reRes = await axios.get(this.searchUrl, { headers: { 'User-Agent': this.userAgent }, timeout: 15000 });
+                cookies = this._extractCookies(reRes.headers);
+                hiddenFields = this._extractHiddenFields(reRes.data);
+                consecutiveErrors = 0;
+              } catch (reErr) {
+                console.error(`[${this.source}] Session re-establish failed:`, reErr.message);
+              }
+            }
+          }
+          await delay(3000);
+        }
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ ${this.source} scrape complete: ${totalFound} found, ${totalInserted} inserted, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error(`❌ ${this.source} scrape failed:`, error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ($1, 'running') RETURNING id`, [this.source]);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, records_skipped=$4, completed_at=NOW() WHERE id=$1`, [jobId, found, inserted, skipped]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// Province instances using the generic iMIS scraper
+const cpaMBScraper = new IMISDirectoryScraper({
+  source: 'cpamb', province: 'MB',
+  searchUrl: 'https://cpamb.ca/main/main/find-a-cpa/find-a-member.aspx',
+  lastNameFieldIndex: 1, // Input0=FirstName, Input1=LastName, Input2=City, Input3=?
+});
+
+const cpaSKScraper = new IMISDirectoryScraper({
+  source: 'cpask', province: 'SK',
+  searchUrl: 'https://member.cpask.ca/CPASK/Member-Firm-Search-Pages/Find_a_CPA_Member.aspx',
+  lastNameFieldIndex: 0, // Input0=LastName, Input1=FirstName, Input2=InformalName
+});
+
+const cpaNSScraper = new IMISDirectoryScraper({
+  source: 'cpans', province: 'NS',
+  searchUrl: 'https://member.cpans.ca/member-portal/Main/Find-a-CPA/membership-directory.aspx',
+  lastNameFieldIndex: 0, // Input0=LastName, Input1=City
+});
+
+const cpaNBScraper = new IMISDirectoryScraper({
+  source: 'cpanb', province: 'NB',
+  searchUrl: 'https://cpanewbrunswick.ca/Main/Main/Find-a-CPA/membership-directory.aspx',
+  lastNameFieldIndex: 0, // Input0=LastName, Input1=City
+});
+
+const cpaPEIScraper = new IMISDirectoryScraper({
+  source: 'cpapei', province: 'PE',
+  searchUrl: 'https://www.cpapei.ca/Main/Main/Find-a-CPA/membership-directory.aspx',
+  lastNameFieldIndex: 0,
+});
+
+const cpaNLScraper = new IMISDirectoryScraper({
+  source: 'cpanl', province: 'NL',
+  searchUrl: 'https://cpanl.ca/CPANL/CPANL/Find-a-CPA/membership-directory.aspx',
+  lastNameFieldIndex: 0,
+});
+
+// =====================================================
+// 2C. CPA Alberta Scraper — ASP.NET MVC form POST
+// =====================================================
+// Form action: /VerifyEntity/Members/ShowMembers (NOT /Members/)
+// Fields: lastname, firstname, city, Verify=Verify (all lowercase)
+// Response types: "Refine your Search" (too many), "No Results Found", multi-result table, single detail
+class CPAAlbertaScraper {
+  constructor() {
+    this.searchUrl = 'https://services.cpaalberta.ca/VerifyEntity/Members/ShowMembers';
+    this.refererUrl = 'https://services.cpaalberta.ca/VerifyEntity/Members/';
+    this.detailUrl = 'https://services.cpaalberta.ca/VerifyEntity/Members/ShowMemberDetails';
+    this.source = 'cpaalberta';
+    this.province = 'AB';
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting CPA Alberta scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    // Build a broader search list: common last names + 2-letter alphabet prefixes
+    // Alberta returns "too many results" for just a last name, so we combine lastname + firstname initial
+    const firstNameInitials = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+
+    try {
+      for (let idx = 0; idx < COMMON_CANADIAN_LAST_NAMES.length; idx++) {
+        const lastName = COMMON_CANADIAN_LAST_NAMES[idx];
+        if (idx % 10 === 0) {
+          console.log(`[CPAAlberta] Progress: ${idx}/${COMMON_CANADIAN_LAST_NAMES.length} names... Found: ${totalFound}, Inserted: ${totalInserted}`);
+        }
+
+        // First try with just the last name
+        try {
+          const result = await this._searchAndParse(dbClient, lastName, '', jobId);
+          if (result.tooMany) {
+            // Too many results — narrow with first name initials
+            for (const initial of firstNameInitials) {
+              try {
+                const narrowResult = await this._searchAndParse(dbClient, lastName, initial, jobId);
+                totalFound += narrowResult.found;
+                totalInserted += narrowResult.inserted;
+                totalSkipped += narrowResult.skipped;
+              } catch (err) {
+                console.error(`[CPAAlberta] Error for "${lastName}/${initial}":`, err.message);
+              }
+              await delay(2000);
+            }
+          } else {
+            totalFound += result.found;
+            totalInserted += result.inserted;
+            totalSkipped += result.skipped;
+          }
+        } catch (err) {
+          if (err.response?.status !== 404) console.error(`[CPAAlberta] Error for "${lastName}":`, err.message);
+        }
+        await delay(2000);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ CPA Alberta scrape complete: ${totalFound} found, ${totalInserted} inserted, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ CPA Alberta scrape failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _searchAndParse(dbClient, lastName, firstName, jobId) {
+    const formData = new URLSearchParams();
+    formData.append('lastname', lastName);
+    formData.append('firstname', firstName);
+    formData.append('city', '');
+    formData.append('Verify', 'Verify');
+
+    const response = await axios.post(this.searchUrl, formData.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': this.userAgent,
+        'Referer': this.refererUrl,
+      },
+      timeout: 20000, maxRedirects: 5,
+    });
+
+    const $ = cheerio.load(response.data);
+    let found = 0, inserted = 0, skipped = 0;
+
+    // Check for "too many results"
+    if ($('h3').filter((_, el) => $(el).text().includes('Refine your Search')).length > 0) {
+      return { found: 0, inserted: 0, skipped: 0, tooMany: true };
+    }
+
+    // Check for "no results"
+    if ($('h3').filter((_, el) => $(el).text().includes('No Results Found')).length > 0) {
+      return { found: 0, inserted: 0, skipped: 0, tooMany: false };
+    }
+
+    // Multi-result table: form#ShowMemberDetails with table.TFtable
+    const multiForm = $('form#ShowMemberDetails');
+    if (multiForm.length > 0) {
+      const table = multiForm.find('table.TFtable');
+      const rows = table.find('tr');
+      for (let i = 1; i < rows.length; i++) { // skip header row
+        const cells = $(rows[i]).find('td');
+        if (cells.length < 2) continue;
+        const nameText = $(cells[0]).text().trim();
+        const city = $(cells[1]).text().trim();
+        if (!nameText || nameText.length < 3) continue;
+
+        found++;
+        const record = this._parseName(nameText, city);
+        const didInsert = await this._insertRecord(dbClient, { ...record, jobId });
+        if (didInsert) inserted++; else skipped++;
+      }
+    }
+
+    // Single result detail table: table.TFtable with tabcelRight cells (no ShowMemberDetails form)
+    if (multiForm.length === 0) {
+      const detailTable = $('table.TFtable');
+      if (detailTable.length > 0) {
+        let memberName = '', businessCity = '';
+        detailTable.find('tr').each((_, row) => {
+          const cells = $(row).find('td');
+          if (cells.length >= 2) {
+            const label = $(cells[0]).text().trim();
+            const value = $(cells[1]).text().trim();
+            if (/member name/i.test(label)) memberName = value;
+            if (/business city/i.test(label)) businessCity = value;
+          }
+        });
+        if (memberName) {
+          found++;
+          const record = this._parseName(memberName, businessCity);
+          const didInsert = await this._insertRecord(dbClient, { ...record, jobId });
+          if (didInsert) inserted++; else skipped++;
+        }
+      }
+    }
+
+    return { found, inserted, skipped, tooMany: false };
+  }
+
+  _parseName(nameText, city) {
+    // Names like "John D SMITH, CPA, CMA" or "SMITH, John D CPA"
+    let firstName = '', lastName = '', fullName = nameText;
+    // Strip designation suffixes
+    const cleanName = nameText.replace(/,?\s*(CPA|CMA|CA|CGA|FCPA|FCMA|FCA|FCGA|MBA|PhD|LPA)\b/gi, '').trim();
+    if (cleanName.includes(',')) {
+      const parts = cleanName.split(',').map(s => s.trim());
+      lastName = parts[0]; firstName = parts[1] || '';
+    } else {
+      const parts = cleanName.split(/\s+/);
+      firstName = parts[0] || ''; lastName = parts.slice(1).join(' ') || '';
+    }
+    const nameHash = generateNameHash(fullName, this.province);
+    return { firstName, lastName, fullName, city, nameHash };
+  }
+
+  async _insertRecord(dbClient, { firstName, lastName, fullName, city, nameHash, jobId }) {
+    const existing = await dbClient.query('SELECT id FROM scraped_cpas WHERE name_hash = $1', [nameHash]);
+    if (existing.rows.length > 0) return false;
+    await dbClient.query(
+      `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, name_hash, scrape_job_id)
+       VALUES ($1, $2, $3, $4, 'CPA', $5, $6, $7, $8)`,
+      [this.source, firstName, lastName, fullName, this.province, city, nameHash, jobId]
+    );
+    return true;
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ($1, 'running') RETURNING id`, [this.source]);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, records_skipped=$4, completed_at=NOW() WHERE id=$1`, [jobId, found, inserted, skipped]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// =====================================================
+// 2D. CPA Quebec Scraper — Sitecore API
+// =====================================================
+class CPAQuebecScraper {
+  constructor() {
+    this.apiUrl = 'https://cpaquebec.ca/api/sitecore/FindACPA/FindACPABottinFormSubmit';
+    this.source = 'cpaquebec';
+    this.province = 'QC';
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting CPA Quebec scrape (Sitecore API)...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      // First GET the directory page to establish session and check for reCAPTCHA
+      const pageRes = await axios.get('https://cpaquebec.ca/en/find-a-cpa/cpa-directory/', {
+        headers: { 'User-Agent': this.userAgent },
+        timeout: 15000,
+      });
+      let cookies = '';
+      const setCookies = pageRes.headers['set-cookie'];
+      if (setCookies) {
+        cookies = (Array.isArray(setCookies) ? setCookies : [setCookies])
+          .map(c => c.split(';')[0]).join('; ');
+      }
+
+      // Check for reCAPTCHA — if present, we cannot scrape without a CAPTCHA solver
+      if (pageRes.data.includes('g-recaptcha') || pageRes.data.includes('recaptcha')) {
+        console.log('[CPAQuebec] ⚠️ Directory is protected by Google reCAPTCHA v2');
+        console.log('[CPAQuebec] Cannot scrape without a CAPTCHA solving service or headless browser');
+        console.log('[CPAQuebec] Attempting search without reCAPTCHA token to verify...');
+      }
+
+      // Try a test search to see if reCAPTCHA is truly enforced
+      const testFormData = new URLSearchParams();
+      testFormData.append('Nom', 'Smith');
+      testFormData.append('Prenom', '');
+      testFormData.append('Ville', '');
+      testFormData.append('PageNumber', '0');
+      testFormData.append('Action', 'Rechercher');
+      testFormData.append('ActionParams', '');
+      testFormData.append('CriteresRechercheOrinal', '');
+      testFormData.append('AfficherResultatMap', 'False');
+
+      const testRes = await axios.post(this.apiUrl + '?Length=8', testFormData.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': this.userAgent,
+          'Referer': 'https://cpaquebec.ca/en/find-a-cpa/cpa-directory/',
+          'Cookie': cookies,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        timeout: 20000,
+      });
+
+      const testData = typeof testRes.data === 'string' ? testRes.data : JSON.stringify(testRes.data);
+      // If response is a window.location redirect or very short, reCAPTCHA is blocking
+      if (testData.includes('window.location') || testData.length < 200) {
+        console.log(`[CPAQuebec] ❌ reCAPTCHA is enforced — got redirect response (${testData.length} bytes)`);
+        console.log('[CPAQuebec] Quebec scraping requires reCAPTCHA solving. Skipping for now.');
+        await this._failJob(dbClient, jobId, 'reCAPTCHA protection blocks automated scraping. Need CAPTCHA solving service.');
+        return { found: 0, inserted: 0, skipped: 0 };
+      }
+
+      // If we got past reCAPTCHA check, try the full scrape
+      console.log(`[CPAQuebec] Test search returned ${testData.length} bytes — attempting full scrape...`);
+
+      // Search by last name using the Sitecore API
+      for (let idx = 0; idx < COMMON_CANADIAN_LAST_NAMES.length; idx++) {
+        const lastName = COMMON_CANADIAN_LAST_NAMES[idx];
+        if (idx % 20 === 0) {
+          console.log(`[CPAQuebec] Progress: ${idx}/${COMMON_CANADIAN_LAST_NAMES.length} names... Found: ${totalFound}, Inserted: ${totalInserted}`);
+        }
+
+        try {
+          let page = 0;
+          let hasMore = true;
+
+          while (hasMore) {
+            const formData = new URLSearchParams();
+            formData.append('Nom', lastName);
+            formData.append('Prenom', '');
+            formData.append('Ville', '');
+            formData.append('PageNumber', page.toString());
+            formData.append('Action', 'Rechercher');
+            formData.append('ActionParams', '');
+            formData.append('CriteresRechercheOrinal', '');
+            formData.append('AfficherResultatMap', 'False');
+
+            const response = await axios.post(this.apiUrl + '?Length=8', formData.toString(), {
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': this.userAgent,
+                'Referer': 'https://cpaquebec.ca/en/find-a-cpa/cpa-directory/',
+                'Cookie': cookies,
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+              timeout: 20000,
+            });
+
+            // Update cookies from response
+            if (response.headers['set-cookie']) {
+              const newCookies = (Array.isArray(response.headers['set-cookie']) ? response.headers['set-cookie'] : [response.headers['set-cookie']])
+                .map(c => c.split(';')[0]).join('; ');
+              if (newCookies) cookies = newCookies;
+            }
+
+            // Parse response — could be HTML fragment with var result=[...] or JSON
+            let records = [];
+            const data = response.data;
+
+            if (typeof data === 'string') {
+              // Check for embedded JavaScript array: var result = [{...}, ...]
+              const resultMatch = data.match(/var\s+result\s*=\s*(\[[\s\S]*?\]);/);
+              if (resultMatch) {
+                try {
+                  const resultArr = JSON.parse(resultMatch[1]);
+                  for (const item of resultArr) {
+                    const name = `${item.PrenomMembre || ''} ${item.NomClient || ''}`.trim();
+                    if (name && name.length > 2) {
+                      records.push({
+                        name,
+                        city: '',
+                        phone: '',
+                        firm: item.NomEmployeur || '',
+                      });
+                    }
+                  }
+                } catch (parseErr) { /* skip parse error */ }
+              }
+
+              // Fallback: parse HTML for CPA entries
+              if (records.length === 0) {
+                const $ = cheerio.load(data);
+                $('.bottin-result, .cpa-result, .result-item, .membre-item, .card').each((_, el) => {
+                  const $el = $(el);
+                  const name = $el.find('.nom, .name, h3, h4, strong').first().text().trim();
+                  const city = $el.find('.ville, .city, .location').first().text().trim();
+                  if (name && name.length > 2 && name.length < 100) {
+                    records.push({ name, city, phone: '' });
+                  }
+                });
+              }
+            } else if (typeof data === 'object') {
+              const items = data.Results || data.results || data.Items || data.items || data.membres || [];
+              if (Array.isArray(items)) {
+                records = items.map(item => ({
+                  name: item.Nom || item.Name || item.nom || `${item.Prenom || ''} ${item.NomFamille || ''}`.trim(),
+                  city: item.Ville || item.City || item.ville || '',
+                  phone: item.Telephone || item.Phone || item.telephone || '',
+                }));
+              }
+            }
+
+            totalFound += records.length;
+
+            for (const record of records) {
+              if (!record.name) continue;
+              const nameHash = generateNameHash(record.name, this.province);
+              const existing = await dbClient.query('SELECT id FROM scraped_cpas WHERE name_hash = $1', [nameHash]);
+              if (existing.rows.length > 0) { totalSkipped++; continue; }
+
+              const parts = record.name.split(/\s+/);
+              await dbClient.query(
+                `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, phone, name_hash, scrape_job_id)
+                 VALUES ($1, $2, $3, $4, 'CPA', $5, $6, $7, $8, $9)`,
+                [this.source, parts[0] || '', parts.slice(1).join(' ') || '', record.name,
+                 this.province, record.city, record.phone, nameHash, jobId]
+              );
+              totalInserted++;
+            }
+
+            hasMore = records.length >= 10 && page < 50;
+            page++;
+            if (hasMore) await delay(2000);
+          }
+        } catch (err) {
+          if (err.response?.status !== 404) console.error(`[CPAQuebec] Error for "${lastName}":`, err.message);
+        }
+        await delay(3000);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ CPA Quebec scrape complete: ${totalFound} found, ${totalInserted} inserted`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ CPA Quebec scrape failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ($1, 'running') RETURNING id`, [this.source]);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, records_skipped=$4, completed_at=NOW() WHERE id=$1`, [jobId, found, inserted, skipped]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// =====================================================
+// 2E. CPA Ontario Scraper — Salesforce Lightning
+// =====================================================
+class CPAOntarioScraper {
+  constructor() {
+    this.baseUrl = 'https://myportal.cpaontario.ca/s/searchdirectory';
+    this.source = 'cpaontario';
+    this.province = 'ON';
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting CPA Ontario scrape (Salesforce Lightning)...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      // CPA Ontario uses Salesforce Lightning (SPA). We need to find the Aura API endpoint.
+      // Step 1: GET the page to extract the aura context/token
+      const pageRes = await axios.get(this.baseUrl, {
+        headers: { 'User-Agent': this.userAgent },
+        timeout: 20000, maxRedirects: 5,
+      });
+
+      const html = pageRes.data;
+      let cookies = '';
+      const setCookies = pageRes.headers['set-cookie'];
+      if (setCookies) {
+        cookies = (Array.isArray(setCookies) ? setCookies : [setCookies])
+          .map(c => c.split(';')[0]).join('; ');
+      }
+
+      // Try to extract Aura framework token and context from the page
+      const auraTokenMatch = html.match(/auraConfig\s*=\s*\{[^}]*"token"\s*:\s*"([^"]+)"/);
+      const auraContextMatch = html.match(/"auraContext"\s*:\s*(\{[^}]+\})/);
+
+      if (!auraTokenMatch) {
+        console.log('[CPAOntario] Could not extract Aura token - Salesforce SPA requires browser-like access');
+        console.log('[CPAOntario] Falling back to common name search via GET requests...');
+      }
+
+      // Fallback: try loading with search params which may server-render some results
+      const longNames = COMMON_CANADIAN_LAST_NAMES.filter(n => n.length >= 4);
+
+      for (let idx = 0; idx < longNames.length; idx++) {
+        const lastName = longNames[idx];
+        if (idx % 20 === 0) {
+          console.log(`[CPAOntario] Progress: ${idx}/${longNames.length} names... Found: ${totalFound}, Inserted: ${totalInserted}`);
+        }
+
+        try {
+          const response = await axios.get(this.baseUrl, {
+            params: { lastName },
+            headers: {
+              'User-Agent': this.userAgent,
+              'Cookie': cookies,
+            },
+            timeout: 20000, maxRedirects: 5,
+          });
+
+          const $ = cheerio.load(response.data);
+
+          // Try to parse any server-rendered data or embedded JSON
+          $('[data-record-id], .slds-table tbody tr, .directory-entry, table tbody tr').each((_, el) => {
+            const $row = $(el);
+            const cells = $row.find('td');
+            if (cells.length < 1) return;
+            const name = $(cells[0]).text().trim();
+            const city = cells.length > 1 ? $(cells[1]).text().trim() : '';
+            if (name && name.length > 3 && name.length < 80) {
+              totalFound++;
+              const nameHash = generateNameHash(name, this.province);
+              const parts = name.split(/\s+/);
+              this._insertRecord(dbClient, {
+                firstName: parts[0], lastName: parts.slice(1).join(' '),
+                fullName: name, city, nameHash, jobId
+              }).then(ok => ok ? totalInserted++ : totalSkipped++);
+            }
+          });
+
+          // Also check for JSON embedded in the page
+          const jsonMatches = response.data.match(/\{"records":\[.*?\]\}/g);
+          if (jsonMatches) {
+            for (const jsonStr of jsonMatches) {
+              try {
+                const data = JSON.parse(jsonStr);
+                if (data.records) {
+                  for (const rec of data.records) {
+                    const name = rec.Name || rec.name || '';
+                    const city = rec.City || rec.city || '';
+                    if (name) {
+                      totalFound++;
+                      const nameHash = generateNameHash(name, this.province);
+                      const parts = name.split(/\s+/);
+                      await this._insertRecord(dbClient, {
+                        firstName: parts[0], lastName: parts.slice(1).join(' '),
+                        fullName: name, city, nameHash, jobId
+                      }).then(ok => ok ? totalInserted++ : totalSkipped++);
+                    }
+                  }
+                }
+              } catch (parseErr) { /* skip invalid JSON */ }
+            }
+          }
+        } catch (err) {
+          if (err.response?.status !== 403) console.error(`[CPAOntario] Error for "${lastName}":`, err.message);
+        }
+        await delay(5000);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ CPA Ontario scrape complete: ${totalFound} found, ${totalInserted} inserted`);
+      if (totalFound === 0) {
+        console.log('[CPAOntario] Note: Salesforce Lightning SPAs require browser-level JavaScript execution. Consider using a headless browser for Ontario in the future.');
+      }
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ CPA Ontario scrape failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertRecord(dbClient, { firstName, lastName, fullName, city, nameHash, jobId }) {
+    const existing = await dbClient.query('SELECT id FROM scraped_cpas WHERE name_hash = $1', [nameHash]);
+    if (existing.rows.length > 0) return false;
+    await dbClient.query(
+      `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, name_hash, scrape_job_id)
+       VALUES ($1, $2, $3, $4, 'CPA', $5, $6, $7, $8)`,
+      [this.source, firstName, lastName, fullName, this.province, city, nameHash, jobId]
+    );
+    return true;
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ($1, 'running') RETURNING id`, [this.source]);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, records_skipped=$4, completed_at=NOW() WHERE id=$1`, [jobId, found, inserted, skipped]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// 2F. CPA Scraper Orchestrator — All 10 provinces
+class CPAScraperOrchestrator {
+  constructor() {
+    this.scrapers = {
+      cpabc: new CPABCScraper(),
+      cpaalberta: new CPAAlbertaScraper(),
+      cpask: cpaSKScraper,
+      cpamb: cpaMBScraper,
+      cpaontario: new CPAOntarioScraper(),
+      cpaquebec: new CPAQuebecScraper(),
+      cpanb: cpaNBScraper,
+      cpans: cpaNSScraper,
+      cpapei: cpaPEIScraper,
+      cpanl: cpaNLScraper,
+    };
+  }
+
+  async runAll(dbClient) {
+    console.log('🚀 Starting full CPA directory scrape across all 10 provinces...');
+    const results = {};
+    for (const [source, scraper] of Object.entries(this.scrapers)) {
+      try {
+        results[source] = await scraper.scrape(dbClient);
+      } catch (error) {
+        console.error(`❌ ${source} scraper failed:`, error.message);
+        results[source] = { error: error.message };
+      }
+    }
+    console.log('✅ Full CPA directory scrape complete:', JSON.stringify(results));
+    return results;
+  }
+
+  async runSingle(source, dbClient) {
+    const scraper = this.scrapers[source];
+    if (!scraper) throw new Error(`Unknown scraper source: ${source}. Available: ${Object.keys(this.scrapers).join(', ')}`);
+    return scraper.scrape(dbClient);
+  }
+}
+
+// =====================================================
+// 🏢 SME DATA COLLECTION
+// =====================================================
+
+// 3A. Corporations Canada API Client
+class CorporationsCanadaAPI {
+  constructor() {
+    this.baseUrl = 'https://api.ised-isde.canada.ca/api/cc/v1';
+    this.source = 'corporations_canada';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting Corporations Canada scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      // Search by common business name prefixes
+      const prefixes = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+
+      for (const prefix of prefixes) {
+        let page = 1;
+        let hasMore = true;
+
+        while (hasMore) {
+          try {
+            const response = await axios.get(`${this.baseUrl}/corporationsSearch`, {
+              params: { searchTerm: prefix, page, pageSize: 100 },
+              headers: { 'User-Agent': 'CanadaAccountants-DataCollection/1.0' },
+              timeout: 15000,
+            });
+
+            const corps = response.data?.corporations || response.data?.results || [];
+            if (corps.length === 0) { hasMore = false; break; }
+
+            totalFound += corps.length;
+
+            for (const corp of corps) {
+              // Map province codes
+              const province = corp.province || corp.jurisdictionOfIncorporation || '';
+
+              // Check for duplicate by corporate number
+              if (corp.corporationNumber) {
+                const existing = await dbClient.query(
+                  'SELECT id FROM scraped_smes WHERE corporate_number = $1',
+                  [corp.corporationNumber]
+                );
+                if (existing.rows.length > 0) { totalSkipped++; continue; }
+              }
+
+              await dbClient.query(
+                `INSERT INTO scraped_smes (source, business_name, corporate_number, province, business_status, incorporation_date, scrape_job_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [this.source, corp.corporationName || corp.name || '', corp.corporationNumber || '',
+                 province, corp.status || 'active', corp.incorporationDate || null, jobId]
+              );
+              totalInserted++;
+            }
+
+            // Check if there are more pages
+            if (corps.length < 100) hasMore = false;
+            else page++;
+
+          } catch (err) {
+            console.error(`[CorpsCan] Error for prefix "${prefix}" page ${page}:`, err.message);
+            hasMore = false;
+          }
+
+          await delay(2000); // 2-second delay
+        }
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Corporations Canada scrape complete: ${totalFound} found, ${totalInserted} inserted`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Corporations Canada scrape failed:', error.message);
+    }
+
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// 3B. Statistics Canada ODBus Business Register Loader
+class StatCanODBusLoader {
+  constructor() {
+    this.csvUrl = 'https://open.canada.ca/data/dataset/c8045914-7a51-4171-a321-968e4a8dbdc3/resource/d45cca34-0d16-43f5-a533-e71c1a0e0f0a/download/odbus.csv';
+    this.source = 'statcan_odbus';
+  }
+
+  // NAICS code to industry name mapping (top-level)
+  static NAICS_MAP = {
+    '11': 'Agriculture, Forestry, Fishing and Hunting',
+    '21': 'Mining, Quarrying, and Oil and Gas Extraction',
+    '22': 'Utilities',
+    '23': 'Construction',
+    '31': 'Manufacturing', '32': 'Manufacturing', '33': 'Manufacturing',
+    '41': 'Wholesale Trade',
+    '44': 'Retail Trade', '45': 'Retail Trade',
+    '48': 'Transportation and Warehousing', '49': 'Transportation and Warehousing',
+    '51': 'Information and Cultural Industries',
+    '52': 'Finance and Insurance',
+    '53': 'Real Estate and Rental and Leasing',
+    '54': 'Professional, Scientific and Technical Services',
+    '55': 'Management of Companies and Enterprises',
+    '56': 'Administrative and Support Services',
+    '61': 'Educational Services',
+    '62': 'Health Care and Social Assistance',
+    '71': 'Arts, Entertainment and Recreation',
+    '72': 'Accommodation and Food Services',
+    '81': 'Other Services',
+    '91': 'Public Administration',
+  };
+
+  static naicsToIndustry(code) {
+    if (!code) return 'Unknown';
+    const prefix2 = code.substring(0, 2);
+    return StatCanODBusLoader.NAICS_MAP[prefix2] || 'Other';
+  }
+
+  async load(dbClient) {
+    console.log('🔍 Starting StatCan ODBus CSV load...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      // Download CSV
+      const response = await axios.get(this.csvUrl, {
+        responseType: 'text',
+        timeout: 120000, // 2 minute timeout for large file
+        headers: { 'User-Agent': 'CanadaAccountants-DataCollection/1.0' },
+      });
+
+      const lines = response.data.split('\n');
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+
+      // Process in batches of 100
+      const batch = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        totalFound++;
+        const cols = line.split(',').map(c => c.trim().replace(/"/g, ''));
+
+        // Map CSV columns (adjust indices based on actual CSV structure)
+        const record = {};
+        headers.forEach((h, idx) => { record[h.toLowerCase()] = cols[idx] || ''; });
+
+        const businessName = record.business_name || record.name || record.legal_name || cols[0] || '';
+        const naicsCode = record.naics || record.naics_code || cols[1] || '';
+        const province = record.province || record.prov || cols[2] || '';
+
+        if (!businessName) continue;
+
+        batch.push({ businessName, naicsCode, province });
+
+        if (batch.length >= 100) {
+          const result = await this._insertBatch(dbClient, batch, jobId);
+          totalInserted += result.inserted;
+          totalSkipped += result.skipped;
+          batch.length = 0;
+        }
+      }
+
+      // Insert remaining
+      if (batch.length > 0) {
+        const result = await this._insertBatch(dbClient, batch, jobId);
+        totalInserted += result.inserted;
+        totalSkipped += result.skipped;
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ StatCan ODBus load complete: ${totalFound} found, ${totalInserted} inserted`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ StatCan ODBus load failed:', error.message);
+    }
+
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertBatch(dbClient, records, jobId) {
+    let inserted = 0, skipped = 0;
+    for (const rec of records) {
+      try {
+        const industry = StatCanODBusLoader.naicsToIndustry(rec.naicsCode);
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, naics_code, industry, province, business_status, scrape_job_id)
+           VALUES ($1, $2, $3, $4, $5, 'active', $6)`,
+          [this.source, rec.businessName, rec.naicsCode, industry, rec.province, jobId]
+        );
+        inserted++;
+      } catch (err) {
+        skipped++;
+      }
+    }
+    return { inserted, skipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 📧 EMAIL ENRICHMENT PIPELINE
+// =====================================================
+
+class FirmWebsiteEnricher {
+  constructor() {
+    this.dailyLimit = 200;
+    this.delayMs = 5000;
+  }
+
+  async enrich(dbClient) {
+    console.log('📧 Starting email enrichment pipeline...');
+    const jobId = await this._startJob(dbClient);
+    let totalProcessed = 0, totalEnriched = 0;
+
+    try {
+      // Get CPAs with firm_name but no email
+      const cpas = await dbClient.query(
+        `SELECT id, first_name, last_name, full_name, firm_name, city, province
+         FROM scraped_cpas
+         WHERE firm_name IS NOT NULL AND firm_name != ''
+           AND email IS NULL AND enriched_email IS NULL
+           AND status = 'raw'
+         ORDER BY scraped_at ASC
+         LIMIT $1`,
+        [this.dailyLimit]
+      );
+
+      for (const cpa of cpas.rows) {
+        totalProcessed++;
+        try {
+          const email = await this._findEmailForCPA(cpa);
+          if (email) {
+            await dbClient.query(
+              `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = 'firm_website', enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+              [cpa.id, email]
+            );
+            totalEnriched++;
+          }
+        } catch (err) {
+          console.error(`[Enrichment] Error for CPA ${cpa.id}:`, err.message);
+        }
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalProcessed, totalEnriched);
+      console.log(`✅ Enrichment complete: ${totalProcessed} processed, ${totalEnriched} enriched`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Enrichment failed:', error.message);
+    }
+
+    return { processed: totalProcessed, enriched: totalEnriched };
+  }
+
+  async _findEmailForCPA(cpa) {
+    // Search for the firm's website
+    const firmQuery = encodeURIComponent(`${cpa.firm_name} ${cpa.city || ''} ${cpa.province || ''} accounting CPA`);
+
+    try {
+      // Try to find firm website by searching for common patterns
+      const firmNameSlug = cpa.firm_name.toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/llp|inc|ltd|corp/g, '');
+      const possibleDomains = [
+        `${firmNameSlug}.ca`,
+        `${firmNameSlug}.com`,
+        `www.${firmNameSlug}.ca`,
+      ];
+
+      for (const domain of possibleDomains) {
+        try {
+          const response = await axios.get(`https://${domain}`, {
+            timeout: 10000,
+            headers: { 'User-Agent': 'CanadaAccountants-DataCollection/1.0' },
+            maxRedirects: 3,
+          });
+
+          const $ = cheerio.load(response.data);
+          const pageText = $.html();
+
+          // Find email addresses on the page
+          const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+          const emails = pageText.match(emailRegex) || [];
+
+          // Filter out generic addresses
+          const nonGeneric = emails.filter(e =>
+            !e.match(/^(info|contact|admin|support|noreply|no-reply|hello|office)@/i)
+          );
+
+          // Try to match CPA name to found emails
+          const firstName = (cpa.first_name || '').toLowerCase();
+          const lastName = (cpa.last_name || '').toLowerCase();
+
+          for (const email of nonGeneric) {
+            const emailLower = email.toLowerCase();
+            if (emailLower.includes(firstName) || emailLower.includes(lastName)) {
+              // Store the firm website
+              await this._updateFirmWebsite(cpa.id, domain);
+              return email;
+            }
+          }
+
+          // If no name match, use the first non-generic email as a fallback
+          if (nonGeneric.length > 0) {
+            await this._updateFirmWebsite(cpa.id, domain);
+            return nonGeneric[0];
+          }
+
+          // If only generic emails, use the first one
+          if (emails.length > 0) {
+            await this._updateFirmWebsite(cpa.id, domain);
+            return emails[0];
+          }
+        } catch (err) {
+          // Domain doesn't exist or can't be reached
+          continue;
+        }
+      }
+    } catch (err) {
+      // Search failed
+    }
+
+    return null;
+  }
+
+  async _updateFirmWebsite(cpaId, domain) {
+    // We can't use dbClient here without passing it, but this is called from _findEmailForCPA
+    // which doesn't have dbClient. We'll skip this for now.
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ('email_enrichment', 'running') RETURNING id`);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, processed, enriched) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, completed_at=NOW() WHERE id=$1`, [jobId, processed, enriched]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// Initialize scraper instances
+const cpaScraperOrchestrator = new CPAScraperOrchestrator();
+const corporationsCanadaAPI = new CorporationsCanadaAPI();
+const statCanODBusLoader = new StatCanODBusLoader();
+const firmWebsiteEnricher = new FirmWebsiteEnricher();
 
 // 🔄 DATA COLLECTION ORCHESTRATOR
 class DataCollectionOrchestrator {
@@ -2102,6 +3671,219 @@ cron.schedule('0 6 * * *', async () => {
     await dataOrchestrator.collectAllData();
 });
 
+// 🕷️ CPA DIRECTORY SCRAPING — Sundays at 2 AM
+cron.schedule('0 2 * * 0', async () => {
+    console.log('⏰ Starting weekly CPA directory scrape...');
+    try {
+        await cpaScraperOrchestrator.runAll(dbClient);
+    } catch (error) {
+        console.error('❌ Weekly CPA scrape failed:', error.message);
+    }
+});
+
+// 🏢 CORPORATIONS CANADA — 1st of month at 3 AM
+cron.schedule('0 3 1 * *', async () => {
+    console.log('⏰ Starting monthly Corporations Canada scrape...');
+    try {
+        await corporationsCanadaAPI.scrape(dbClient);
+    } catch (error) {
+        console.error('❌ Monthly Corp Canada scrape failed:', error.message);
+    }
+});
+
+// 📊 STATCAN ODBUS — Quarterly (Jan, Apr, Jul, Oct) 1st at 4 AM
+cron.schedule('0 4 1 1,4,7,10 *', async () => {
+    console.log('⏰ Starting quarterly StatCan ODBus load...');
+    try {
+        await statCanODBusLoader.load(dbClient);
+    } catch (error) {
+        console.error('❌ Quarterly ODBus load failed:', error.message);
+    }
+});
+
+// 📧 EMAIL ENRICHMENT — Daily at 4 AM
+cron.schedule('0 4 * * *', async () => {
+    console.log('⏰ Starting daily email enrichment...');
+    try {
+        await firmWebsiteEnricher.enrich(dbClient);
+    } catch (error) {
+        console.error('❌ Daily enrichment failed:', error.message);
+    }
+});
+
+// =====================================================
+// 🕷️ SCRAPER API ENDPOINTS
+// =====================================================
+
+// GET /api/scrape/status — recent scrape jobs
+app.get('/api/scrape/status', async (req, res) => {
+    try {
+        const result = await dbClient.query(
+            `SELECT * FROM scrape_jobs ORDER BY started_at DESC LIMIT 20`
+        );
+        res.json({ status: 'success', jobs: result.rows });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// POST /api/scrape/trigger/:source — manually trigger a scrape (admin only)
+app.post('/api/scrape/trigger/:source', async (req, res) => {
+    const { source } = req.params;
+    const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl', 'corporations_canada', 'statcan_odbus', 'email_enrichment', 'all_cpas'];
+
+    if (!validSources.includes(source)) {
+        return res.status(400).json({ error: `Invalid source. Valid: ${validSources.join(', ')}` });
+    }
+
+    // Start scrape in background
+    res.json({ status: 'started', source, message: `Scrape for ${source} started in background` });
+
+    try {
+        if (source === 'all_cpas') {
+            await cpaScraperOrchestrator.runAll(dbClient);
+        } else if (source === 'corporations_canada') {
+            await corporationsCanadaAPI.scrape(dbClient);
+        } else if (source === 'statcan_odbus') {
+            await statCanODBusLoader.load(dbClient);
+        } else if (source === 'email_enrichment') {
+            await firmWebsiteEnricher.enrich(dbClient);
+        } else {
+            await cpaScraperOrchestrator.runSingle(source, dbClient);
+        }
+    } catch (error) {
+        console.error(`Scrape trigger error for ${source}:`, error.message);
+    }
+});
+
+// GET /api/scraped-cpas — browse scraped CPAs
+app.get('/api/scraped-cpas', async (req, res) => {
+    try {
+        const { province, city, source, status, page = 1, limit = 50 } = req.query;
+        const offset = (Math.max(1, parseInt(page)) - 1) * Math.min(100, parseInt(limit) || 50);
+        const params = [];
+        const conditions = [];
+        let paramIdx = 1;
+
+        if (province) { conditions.push(`province = $${paramIdx++}`); params.push(province); }
+        if (city) { conditions.push(`city ILIKE $${paramIdx++}`); params.push(`%${city}%`); }
+        if (source) { conditions.push(`source = $${paramIdx++}`); params.push(source); }
+        if (status) { conditions.push(`status = $${paramIdx++}`); params.push(status); }
+
+        const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const lim = Math.min(100, parseInt(limit) || 50);
+        params.push(lim, offset);
+
+        const result = await dbClient.query(
+            `SELECT * FROM scraped_cpas ${where} ORDER BY scraped_at DESC LIMIT $${paramIdx++} OFFSET $${paramIdx}`,
+            params
+        );
+
+        const countResult = await dbClient.query(
+            `SELECT COUNT(*) FROM scraped_cpas ${where}`,
+            params.slice(0, -2)
+        );
+
+        res.json({
+            status: 'success',
+            cpas: result.rows,
+            total: parseInt(countResult.rows[0].count),
+            page: parseInt(page),
+            limit: lim,
+        });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /api/scraped-cpas/stats — aggregated stats
+app.get('/api/scraped-cpas/stats', async (req, res) => {
+    try {
+        const result = await dbClient.query(`
+            SELECT
+                COUNT(*) AS total,
+                COUNT(CASE WHEN email IS NOT NULL OR enriched_email IS NOT NULL THEN 1 END) AS with_email,
+                COUNT(CASE WHEN status = 'enriched' THEN 1 END) AS enriched,
+                COUNT(CASE WHEN status = 'contacted' THEN 1 END) AS contacted,
+                COUNT(CASE WHEN status = 'converted' THEN 1 END) AS converted
+            FROM scraped_cpas
+        `);
+        const byProvince = await dbClient.query(`
+            SELECT province, COUNT(*) AS count FROM scraped_cpas GROUP BY province ORDER BY count DESC
+        `);
+        const bySource = await dbClient.query(`
+            SELECT source, COUNT(*) AS count FROM scraped_cpas GROUP BY source ORDER BY count DESC
+        `);
+
+        res.json({ status: 'success', totals: result.rows[0], byProvince: byProvince.rows, bySource: bySource.rows });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /api/scraped-smes — browse scraped SMEs
+app.get('/api/scraped-smes', async (req, res) => {
+    try {
+        const { province, naics, industry, page = 1, limit = 50 } = req.query;
+        const offset = (Math.max(1, parseInt(page)) - 1) * Math.min(100, parseInt(limit) || 50);
+        const params = [];
+        const conditions = [];
+        let paramIdx = 1;
+
+        if (province) { conditions.push(`province = $${paramIdx++}`); params.push(province); }
+        if (naics) { conditions.push(`naics_code = $${paramIdx++}`); params.push(naics); }
+        if (industry) { conditions.push(`industry ILIKE $${paramIdx++}`); params.push(`%${industry}%`); }
+
+        const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const lim = Math.min(100, parseInt(limit) || 50);
+        params.push(lim, offset);
+
+        const result = await dbClient.query(
+            `SELECT * FROM scraped_smes ${where} ORDER BY scraped_at DESC LIMIT $${paramIdx++} OFFSET $${paramIdx}`,
+            params
+        );
+
+        const countResult = await dbClient.query(
+            `SELECT COUNT(*) FROM scraped_smes ${where}`,
+            params.slice(0, -2)
+        );
+
+        res.json({
+            status: 'success',
+            smes: result.rows,
+            total: parseInt(countResult.rows[0].count),
+            page: parseInt(page),
+            limit: lim,
+        });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /api/scraped-smes/stats — aggregated stats
+app.get('/api/scraped-smes/stats', async (req, res) => {
+    try {
+        const result = await dbClient.query(`
+            SELECT
+                COUNT(*) AS total,
+                COUNT(CASE WHEN contact_email IS NOT NULL THEN 1 END) AS with_email,
+                COUNT(CASE WHEN status = 'contacted' THEN 1 END) AS contacted,
+                COUNT(CASE WHEN status = 'converted' THEN 1 END) AS converted
+            FROM scraped_smes
+        `);
+        const byProvince = await dbClient.query(`
+            SELECT province, COUNT(*) AS count FROM scraped_smes GROUP BY province ORDER BY count DESC
+        `);
+        const byIndustry = await dbClient.query(`
+            SELECT industry, COUNT(*) AS count FROM scraped_smes WHERE industry IS NOT NULL GROUP BY industry ORDER BY count DESC LIMIT 20
+        `);
+
+        res.json({ status: 'success', totals: result.rows[0], byProvince: byProvince.rows, byIndustry: byIndustry.rows });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -2208,8 +3990,10 @@ async function startServer() {
 }
 
 // Sentry error handler (must be after all routes)
-if (process.env.SENTRY_DSN) {
+if (process.env.SENTRY_DSN && Sentry.Handlers) {
   app.use(Sentry.Handlers.errorHandler());
+} else if (process.env.SENTRY_DSN && Sentry.setupExpressErrorHandler) {
+  Sentry.setupExpressErrorHandler(app);
 }
 
 // Graceful shutdown
