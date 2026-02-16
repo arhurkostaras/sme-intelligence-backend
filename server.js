@@ -1719,7 +1719,7 @@ class CorporationsCanadaAPI {
           formData.append('corpNumber', '');
           formData.append('busNumber', '');
           formData.append('corpProvince', '');
-          formData.append('corpStatus', 'Active');
+          formData.append('corpStatus', '1'); // 1=Active, 9=Amalgamated, 10=Discontinued, 11=Dissolved, ''=Any
           formData.append('corpAct', '');
           formData.append('buttonNext', 'Search');
           formData.append('_pageFlowMap', '');
@@ -1858,18 +1858,24 @@ class StatCanODBusLoader {
       });
       console.log(`[ODBus] Downloaded ${(response.data.byteLength / 1048576).toFixed(1)}MB`);
 
-      // Extract CSV from ZIP
+      // Extract CSV from ZIP — find the largest CSV file (the main data file ~112MB)
       const zip = new AdmZip(Buffer.from(response.data));
       const entries = zip.getEntries();
-      const csvEntry = entries.find(e => e.entryName.endsWith('.csv') && e.entryName.includes('ODBus_v1'));
-      if (!csvEntry) {
-        // Fallback: find any large CSV
-        const anyCsv = entries.find(e => e.entryName.endsWith('.csv') && e.getData().length > 1000000);
-        if (!anyCsv) throw new Error('Could not find ODBus CSV in ZIP archive. Entries: ' + entries.map(e => e.entryName).join(', '));
-        console.log(`[ODBus] Using fallback CSV: ${anyCsv.entryName}`);
+      console.log(`[ODBus] ZIP entries: ${entries.map(e => `${e.entryName} (${(e.header.size / 1024).toFixed(0)}KB)`).join(', ')}`);
+
+      // Sort CSV entries by size descending, pick the largest one
+      const csvEntries = entries
+        .filter(e => e.entryName.endsWith('.csv'))
+        .sort((a, b) => b.header.size - a.header.size);
+
+      if (csvEntries.length === 0) {
+        throw new Error('No CSV files found in ZIP archive. Entries: ' + entries.map(e => e.entryName).join(', '));
       }
 
-      const csvData = (csvEntry || entries.find(e => e.entryName.endsWith('.csv') && e.getData().length > 1000000)).getData().toString('utf8');
+      const mainCsv = csvEntries[0]; // Largest CSV = main data file
+      console.log(`[ODBus] Using CSV: ${mainCsv.entryName} (${(mainCsv.header.size / 1048576).toFixed(1)}MB)`);
+
+      const csvData = mainCsv.getData().toString('utf8');
       const lines = csvData.split('\n');
       console.log(`[ODBus] CSV has ${lines.length} lines`);
 
@@ -1897,13 +1903,16 @@ class StatCanODBusLoader {
         // Parse CSV line (handle quoted fields with commas)
         const cols = this._parseCSVLine(line);
 
-        const businessName = cols[colIdx['business_name']] || '';
-        const naicsCode = cols[colIdx['derived_naics']] || cols[colIdx['source_naics_primary']] || '';
-        const naicsDescr = cols[colIdx['naics_descr']] || '';
-        const province = cols[colIdx['prov_terr']] || '';
-        const city = cols[colIdx['city']] || '';
-        const status = cols[colIdx['status']] || 'Active';
-        const employees = cols[colIdx['total_no_employees']] || '';
+        // Helper: treat '..' as empty (StatCan missing value notation)
+        const val = (idx) => { const v = (cols[idx] || '').trim(); return v === '..' ? '' : v; };
+
+        const businessName = val(colIdx['business_name']);
+        const naicsCode = val(colIdx['derived_naics']) || val(colIdx['source_naics_primary']);
+        const naicsDescr = val(colIdx['naics_descr']);
+        const province = val(colIdx['prov_terr']);
+        const city = val(colIdx['city']);
+        const status = val(colIdx['status']) || 'Active';
+        const employees = val(colIdx['total_no_employees']);
 
         if (!businessName || businessName.length < 2) continue;
 
