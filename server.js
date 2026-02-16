@@ -565,11 +565,6 @@ class CPABCScraper {
       const cellTexts = [];
       cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
 
-      // Debug: log cell count and contents for first row
-      if (records.length === 0) {
-        console.log(`[CPABC DEBUG] Cell count: ${cells.length}, Texts: ${JSON.stringify(cellTexts.slice(0, 9))}`);
-      }
-
       if (!cellTexts[0] || cellTexts[0].length < 2) return;
 
       // Column 0: "LastName (Preferred) FirstName, CPA, CA" — name with designation embedded
