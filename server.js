@@ -549,88 +549,57 @@ class CPABCScraper {
   }
 
   // Parse CPA records from the Telerik RadGrid results table
+  // BC columns: Name+Desig(0), MemberStatus(1), PublicNotice(2), City(3), LicenceCategory(4), LicenceStatus(5), Firm(6), Hidden(7)
   _parseResults(html) {
     const $ = cheerio.load(html);
     const records = [];
 
-    // Telerik RadGrid uses table with class rgMasterTable
-    // Rows have classes rgRow and rgAltRow
     $('table.rgMasterTable tbody tr, table[id*="ResultsGrid"] tbody tr').each((_, row) => {
       const $row = $(row);
-      // Skip header rows, pager rows, and "no records" rows
       if ($row.hasClass('rgHeader') || $row.hasClass('rgPager') || $row.hasClass('rgNoRecords')) return;
       if ($row.find('th').length > 0) return;
 
       const cells = $row.find('td');
-      if (cells.length < 2) return;
+      if (cells.length < 4) return;
 
-      // Try to extract data from cells - typical layout: Name, City, Designation
       const cellTexts = [];
-      cells.each((_, cell) => {
-        cellTexts.push($(cell).text().trim());
-      });
+      cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
 
-      if (cellTexts.length >= 2 && cellTexts[0]) {
-        // Name is usually "LastName, FirstName" or just a full name
-        let firstName = '', lastName = '', fullName = cellTexts[0];
-        if (cellTexts[0].includes(',')) {
-          const parts = cellTexts[0].split(',').map(s => s.trim());
-          lastName = parts[0] || '';
-          firstName = parts[1] || '';
-        } else {
-          const parts = cellTexts[0].split(/\s+/);
-          firstName = parts[0] || '';
-          lastName = parts.slice(1).join(' ') || '';
-        }
+      if (!cellTexts[0] || cellTexts[0].length < 2) return;
 
-        records.push({
-          firstName,
-          lastName,
-          fullName,
-          city: cellTexts[1] || '',
-          designation: cellTexts[2] || 'CPA',
-        });
+      // Column 0: "LastName (Preferred) FirstName, CPA, CA" — name with designation embedded
+      const nameRaw = cellTexts[0];
+      let firstName = '', lastName = '', fullName = nameRaw, designation = 'CPA';
+
+      // Strip designation suffixes (CPA, CA, CMA, CGA, etc.)
+      const designationMatch = nameRaw.match(/,\s*(CPA[\s,A-Z]*?)$/i);
+      let nameClean = nameRaw;
+      if (designationMatch) {
+        designation = designationMatch[1].trim();
+        nameClean = nameRaw.slice(0, designationMatch.index).trim();
       }
+
+      // Parse "LastName (Preferred) FirstName" or "LastName, FirstName"
+      if (nameClean.includes(',')) {
+        const parts = nameClean.split(',').map(s => s.trim());
+        lastName = parts[0] || '';
+        firstName = parts[1] || '';
+      } else {
+        const parts = nameClean.split(/\s+/);
+        firstName = parts[0] || '';
+        lastName = parts.slice(1).join(' ') || '';
+      }
+      fullName = `${firstName} ${lastName}`.trim() || nameClean;
+
+      // Column 3: City of Employment (e.g., "Vancouver (BC)")
+      let city = cellTexts[3] || '';
+      city = city.replace(/\s*\([A-Z]{2}\)\s*$/, '').trim(); // Strip province suffix
+
+      // Column 6: Registered Firm
+      const firmName = (cells.length > 6 ? cellTexts[6] : '') || '';
+
+      records.push({ firstName, lastName, fullName, city, designation, firmName });
     });
-
-    // Fallback: if RadGrid not found, try any data table in the results area
-    if (records.length === 0) {
-      $('table tr').each((_, row) => {
-        const $row = $(row);
-        const cells = $row.find('td');
-        if (cells.length < 2) return;
-
-        const cellTexts = [];
-        cells.each((_, cell) => {
-          cellTexts.push($(cell).text().trim());
-        });
-
-        // Heuristic: skip rows that look like headers or navigation
-        if (!cellTexts[0] || cellTexts[0].length > 100) return;
-        if (cellTexts[0].toLowerCase().includes('name') && cellTexts[1].toLowerCase().includes('city')) return;
-
-        // Check if first cell looks like a person name (contains letters, no digits)
-        if (/^[a-zA-Z\s,.-]+$/.test(cellTexts[0]) && cellTexts[0].length > 2) {
-          let firstName = '', lastName = '', fullName = cellTexts[0];
-          if (cellTexts[0].includes(',')) {
-            const parts = cellTexts[0].split(',').map(s => s.trim());
-            lastName = parts[0] || '';
-            firstName = parts[1] || '';
-          } else {
-            const parts = cellTexts[0].split(/\s+/);
-            firstName = parts[0] || '';
-            lastName = parts.slice(1).join(' ') || '';
-          }
-          records.push({
-            firstName,
-            lastName,
-            fullName,
-            city: cellTexts[1] || '',
-            designation: cellTexts[2] || 'CPA',
-          });
-        }
-      });
-    }
 
     return records;
   }
@@ -749,7 +718,7 @@ class CPABCScraper {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
                 [this.source, record.firstName, record.lastName, fullName,
                  record.designation || 'CPA', this.province, record.city || '',
-                 '', nameHash, jobId]
+                 record.firmName || '', nameHash, jobId]
               );
               totalInserted++;
             }
@@ -828,13 +797,20 @@ class CPABCScraper {
 // =====================================================
 // All these provinces use ASP.NET iMIS with Telerik RadGrid
 class IMISDirectoryScraper {
-  constructor({ source, province, searchUrl, lastNameFieldIndex, userAgent, exactMatchOnly }) {
+  constructor({ source, province, searchUrl, lastNameFieldIndex, userAgent, exactMatchOnly, columnMap }) {
     this.source = source;
     this.province = province;
     this.searchUrl = searchUrl;
     this.lastNameFieldIndex = lastNameFieldIndex || 0; // which Input# is the last name
     this.exactMatchOnly = exactMatchOnly || false; // if true, use common names instead of 2-letter prefixes
     this.userAgent = userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // Per-province column mapping for result table
+    // Keys: fullName, firstName, lastName, city, designation
+    // Values: column index in the result table
+    // If fullName is set, that single column has the full name
+    // If firstName+lastName are set, name is split across two columns
+    // Special: designationEmbeddedInLastName=true means designation is appended to last name col (NS)
+    this.columnMap = columnMap || { fullName: 0, city: 1, designation: 2 };
   }
 
   _extractCookies(headers) {
@@ -885,6 +861,7 @@ class IMISDirectoryScraper {
   _parseResults(html) {
     const $ = cheerio.load(html);
     const records = [];
+    const cm = this.columnMap;
 
     // iMIS Telerik RadGrid: rows with rgRow/rgAltRow classes
     $('table.rgMasterTable tbody tr, table[id*="ResultsGrid"] tbody tr, table[id*="Grid1"] tbody tr').each((_, row) => {
@@ -892,43 +869,87 @@ class IMISDirectoryScraper {
       if ($row.hasClass('rgHeader') || $row.hasClass('rgPager') || $row.hasClass('rgNoRecords')) return;
       if ($row.find('th').length > 0) return;
       const cells = $row.find('td');
-      if (cells.length < 1) return;
+      if (cells.length < 2) return;
       const cellTexts = [];
       cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
-      if (!cellTexts[0] || cellTexts[0].length < 2) return;
 
-      let firstName = '', lastName = '', fullName = cellTexts[0];
-      if (cellTexts[0].includes(',')) {
-        const parts = cellTexts[0].split(',').map(s => s.trim());
-        lastName = parts[0] || '';
-        firstName = parts[1] || '';
+      let firstName = '', lastName = '', fullName = '', city = '', designation = 'CPA';
+
+      if (cm.fullName !== undefined) {
+        // Single column has the full name (NB, NL style)
+        fullName = cellTexts[cm.fullName] || '';
+        if (!fullName || fullName.length < 2) return;
+        if (fullName.includes(',')) {
+          const parts = fullName.split(',').map(s => s.trim());
+          lastName = parts[0] || '';
+          firstName = parts[1] || '';
+        } else {
+          const parts = fullName.split(/\s+/);
+          firstName = parts[0] || '';
+          lastName = parts.slice(1).join(' ') || '';
+        }
       } else {
-        const parts = cellTexts[0].split(/\s+/);
-        firstName = parts[0] || '';
-        lastName = parts.slice(1).join(' ') || '';
+        // Separate first name and last name columns
+        firstName = (cm.firstName !== undefined ? cellTexts[cm.firstName] : '') || '';
+        lastName = (cm.lastName !== undefined ? cellTexts[cm.lastName] : '') || '';
+
+        // NS special case: designation embedded in last name column (e.g., "Smith, CPA, CA")
+        if (cm.designationEmbeddedInLastName && lastName.includes(',')) {
+          const parts = lastName.split(',').map(s => s.trim());
+          lastName = parts[0];
+          designation = parts.slice(1).join(', ') || 'CPA';
+        }
+
+        if (!firstName && !lastName) return;
+        fullName = `${firstName} ${lastName}`.trim();
       }
-      records.push({ firstName, lastName, fullName, city: cellTexts[1] || '', designation: cellTexts[2] || 'CPA' });
+
+      city = (cm.city !== undefined ? cellTexts[cm.city] : '') || '';
+      if (cm.designation !== undefined && cellTexts[cm.designation]) {
+        designation = cellTexts[cm.designation];
+      }
+
+      records.push({ firstName, lastName, fullName, city, designation });
     });
 
-    // Fallback: try any data table
+    // Fallback: try any data table with same column map logic
     if (records.length === 0) {
       $('table tr').each((_, row) => {
         const cells = $(row).find('td');
         if (cells.length < 2) return;
         const cellTexts = [];
         cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
-        if (!cellTexts[0] || cellTexts[0].length > 100 || cellTexts[0].length < 3) return;
+        if (!cellTexts[0] || cellTexts[0].length > 100 || cellTexts[0].length < 2) return;
         if (/name/i.test(cellTexts[0]) && /city|town/i.test(cellTexts[1])) return;
-        if (/^[a-zA-ZÀ-ÿ\s,.''-]+$/.test(cellTexts[0])) {
-          let firstName = '', lastName = '', fullName = cellTexts[0];
-          if (cellTexts[0].includes(',')) {
-            const parts = cellTexts[0].split(',').map(s => s.trim());
+
+        let firstName = '', lastName = '', fullName = '', city = '', designation = 'CPA';
+
+        if (cm.fullName !== undefined) {
+          fullName = cellTexts[cm.fullName] || '';
+          if (!fullName || fullName.length < 2) return;
+          if (fullName.includes(',')) {
+            const parts = fullName.split(',').map(s => s.trim());
             lastName = parts[0]; firstName = parts[1] || '';
           } else {
-            const parts = cellTexts[0].split(/\s+/);
+            const parts = fullName.split(/\s+/);
             firstName = parts[0]; lastName = parts.slice(1).join(' ');
           }
-          records.push({ firstName, lastName, fullName, city: cellTexts[1] || '', designation: 'CPA' });
+        } else {
+          firstName = (cm.firstName !== undefined ? cellTexts[cm.firstName] : '') || '';
+          lastName = (cm.lastName !== undefined ? cellTexts[cm.lastName] : '') || '';
+          if (cm.designationEmbeddedInLastName && lastName.includes(',')) {
+            const parts = lastName.split(',').map(s => s.trim());
+            lastName = parts[0];
+            designation = parts.slice(1).join(', ') || 'CPA';
+          }
+          if (!firstName && !lastName) return;
+          fullName = `${firstName} ${lastName}`.trim();
+        }
+
+        city = (cm.city !== undefined ? cellTexts[cm.city] : '') || '';
+        if (cm.designation !== undefined && cellTexts[cm.designation]) designation = cellTexts[cm.designation];
+        if (/^[a-zA-ZÀ-ÿ\s,.''-]+$/.test(fullName)) {
+          records.push({ firstName, lastName, fullName, city, designation });
         }
       });
     }
@@ -1076,41 +1097,55 @@ class IMISDirectoryScraper {
 }
 
 // Province instances using the generic iMIS scraper
+// Column maps match actual HTML table structure per province
+
+// MB: 8 cols — FirstName(0), Informal(1), MiddleName(2), LastName(3), Designation(4), City(5), Status(6), MemberType(7)
 const cpaMBScraper = new IMISDirectoryScraper({
   source: 'cpamb', province: 'MB',
   searchUrl: 'https://cpamb.ca/main/main/find-a-cpa/find-a-member.aspx',
-  lastNameFieldIndex: 1, // Input0=FirstName, Input1=LastName, Input2=City, Input3=?
+  lastNameFieldIndex: 2, // Input0=FirstName, Input1=Informal, Input2=LastName, Input3=City
+  columnMap: { firstName: 0, lastName: 3, designation: 4, city: 5 },
 });
 
+// SK: 11 cols — FirstName(0), Informal(1), LastName(2), Designation(3), Status(4), Category(5), City(6), ...
 const cpaSKScraper = new IMISDirectoryScraper({
   source: 'cpask', province: 'SK',
   searchUrl: 'https://member.cpask.ca/CPASK/Member-Firm-Search-Pages/Find_a_CPA_Member.aspx',
-  lastNameFieldIndex: 0, // Input0=LastName, Input1=FirstName, Input2=InformalName
-  exactMatchOnly: true, // SK requires exact last name match
+  lastNameFieldIndex: 0, // Input0=LastName
+  exactMatchOnly: true,
+  columnMap: { firstName: 0, lastName: 2, designation: 3, city: 6 },
 });
 
+// NS: 6 cols — LastName+Desig(0), FirstName(1), PreferredName(2), City(3), PALicence(4), Hidden(5)
 const cpaNSScraper = new IMISDirectoryScraper({
   source: 'cpans', province: 'NS',
   searchUrl: 'https://member.cpans.ca/member-portal/Main/Find-a-CPA/membership-directory.aspx',
-  lastNameFieldIndex: 0, // Input0=LastName, Input1=City
+  lastNameFieldIndex: 0,
+  columnMap: { firstName: 1, lastName: 0, city: 3, designationEmbeddedInLastName: true },
 });
 
+// NB: 4 cols — Name(0), Designation(1), City(2), Status(3)
 const cpaNBScraper = new IMISDirectoryScraper({
   source: 'cpanb', province: 'NB',
   searchUrl: 'https://cpanewbrunswick.ca/Main/Main/Find-a-CPA/membership-directory.aspx',
-  lastNameFieldIndex: 0, // Input0=LastName, Input1=City
+  lastNameFieldIndex: 0,
+  columnMap: { fullName: 0, designation: 1, city: 2 },
 });
 
+// PEI: 5 cols — Informal(0), LastName(1), Designation(2), City(3), Status(4)
 const cpaPEIScraper = new IMISDirectoryScraper({
   source: 'cpapei', province: 'PE',
   searchUrl: 'https://www.cpapei.ca/Main/Main/Find-a-CPA/membership-directory.aspx',
   lastNameFieldIndex: 0,
+  columnMap: { firstName: 0, lastName: 1, designation: 2, city: 3 },
 });
 
+// NL: 4 cols — Name(0), Designation(1), City(2), Status(3)
 const cpaNLScraper = new IMISDirectoryScraper({
   source: 'cpanl', province: 'NL',
   searchUrl: 'https://cpanl.ca/CPANL/CPANL/Find-a-CPA/membership-directory.aspx',
   lastNameFieldIndex: 0,
+  columnMap: { fullName: 0, designation: 1, city: 2 },
 });
 
 // =====================================================
@@ -3862,6 +3897,38 @@ app.get('/api/scrape/status', async (req, res) => {
         res.json({ status: 'success', jobs: result.rows });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// POST /api/scrape/rescrape/:source — clear existing data and re-scrape (admin only)
+app.post('/api/scrape/rescrape/:source', async (req, res) => {
+    const { source } = req.params;
+    const cpaSources = ['cpabc', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl', 'cpaalberta'];
+    if (!cpaSources.includes(source) && source !== 'all_cpas') {
+        return res.status(400).json({ error: `Invalid source for rescrape. Valid: ${cpaSources.join(', ')}, all_cpas` });
+    }
+
+    try {
+        // Clear existing data for this source
+        const sources = source === 'all_cpas' ? cpaSources : [source];
+        let totalDeleted = 0;
+        for (const s of sources) {
+            const del = await dbClient.query('DELETE FROM scraped_cpas WHERE source = $1', [s]);
+            totalDeleted += del.rowCount;
+            console.log(`[Rescrape] Deleted ${del.rowCount} records for source ${s}`);
+        }
+
+        res.json({ status: 'started', source, deleted: totalDeleted, message: `Cleared ${totalDeleted} records, re-scrape started in background` });
+
+        // Trigger scrape in background
+        if (source === 'all_cpas') {
+            await cpaScraperOrchestrator.runAll(dbClient);
+        } else {
+            await cpaScraperOrchestrator.runSingle(source, dbClient);
+        }
+    } catch (error) {
+        console.error(`Rescrape error for ${source}:`, error.message);
+        if (!res.headersSent) res.status(500).json({ error: error.message });
     }
 });
 
