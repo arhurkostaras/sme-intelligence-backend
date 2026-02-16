@@ -2275,8 +2275,14 @@ class FirmWebsiteEnricher {
         for (const email of found) {
           // Skip image/asset false positives
           if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
-          // Skip dummy/example addresses
-          if (email.match(/^(example|test|user|email)@/i)) continue;
+          // Skip dummy/example/template addresses
+          if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
+          // Skip dummy domains
+          if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.)/i)) continue;
+          // Skip known template/framework artifact emails
+          if (email.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)) continue;
+          // Skip very short local parts (likely false positives like "a@b.com")
+          if (email.split('@')[0].length < 3) continue;
 
           allEmails.add(email);
           const emailLower = email.toLowerCase();
