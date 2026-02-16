@@ -565,6 +565,11 @@ class CPABCScraper {
       const cellTexts = [];
       cells.each((_, cell) => cellTexts.push($(cell).text().trim()));
 
+      // Debug: log cell count and contents for first row
+      if (records.length === 0) {
+        console.log(`[CPABC DEBUG] Cell count: ${cells.length}, Texts: ${JSON.stringify(cellTexts.slice(0, 9))}`);
+      }
+
       if (!cellTexts[0] || cellTexts[0].length < 2) return;
 
       // Column 0: "LastName (Preferred) FirstName, CPA, CA" — name with designation embedded
@@ -579,16 +584,27 @@ class CPABCScraper {
         nameClean = nameRaw.slice(0, designationMatch.index).trim();
       }
 
-      // Parse "LastName (Preferred) FirstName" or "LastName, FirstName"
+      // Parse "Krohman, Darcy W." or "Krohman (Darcy) W." or "Darcy W. Krohman"
       if (nameClean.includes(',')) {
         const parts = nameClean.split(',').map(s => s.trim());
-        lastName = parts[0] || '';
-        firstName = parts[1] || '';
+        lastName = parts[0].replace(/\s*\(.*?\)\s*/g, '').trim();
+        firstName = parts[1] ? parts[1].replace(/\s*\(.*?\)\s*/g, '').trim().split(/\s+/)[0] : '';
       } else {
-        const parts = nameClean.split(/\s+/);
-        firstName = parts[0] || '';
-        lastName = parts.slice(1).join(' ') || '';
+        // Extract preferred name from parentheses if present: "Darcy (Darcy) W. Krohman"
+        const preferredMatch = nameClean.match(/\(([^)]+)\)/);
+        const cleaned = nameClean.replace(/\s*\(.*?\)\s*/g, ' ').trim();
+        const parts = cleaned.split(/\s+/);
+        if (parts.length >= 2) {
+          // Last word is the last name, first word is first name
+          lastName = parts[parts.length - 1];
+          firstName = preferredMatch ? preferredMatch[1] : parts[0];
+        } else {
+          firstName = parts[0] || '';
+          lastName = '';
+        }
       }
+      // Remove middle initials like "W." from firstName
+      firstName = firstName.replace(/\s+[A-Z]\.\s*/g, '').trim();
       fullName = `${firstName} ${lastName}`.trim() || nameClean;
 
       // Column 3: City of Employment (e.g., "Vancouver (BC)")
@@ -2203,49 +2219,91 @@ class FirmWebsiteEnricher {
     return null;
   }
 
-  // Strategy 2: No firm name — try to find CPA via common large firm directories
+  // Strategy 2: No firm name — crawl large CPA firm team/people pages and match names
   async _findEmailNoFirm(cpa) {
-    // Skip if we don't have enough data to search
-    const firstName = (cpa.first_name || '').trim();
-    const lastName = (cpa.last_name || '').trim();
-    if (!lastName || lastName.length < 2) return null;
+    const firstName = (cpa.first_name || '').trim().toLowerCase();
+    const lastName = (cpa.last_name || '').trim().toLowerCase();
+    // Clean up parenthetical preferred names like "(Darcy) W."
+    const lastNameClean = lastName.replace(/\(.*?\)/g, '').replace(/\b[a-z]\.\s*/g, '').trim();
+    if (!lastNameClean || lastNameClean.length < 2) return null;
+    if (!firstName || firstName.length < 2) return null;
 
-    // Try well-known large CPA firm websites that list their staff
+    // Large CPA firms with public team directories
     const largeFirms = [
-      { domain: 'bdo.ca', name: 'BDO Canada' },
-      { domain: 'mnp.ca', name: 'MNP LLP' },
-      { domain: 'grantthornton.ca', name: 'Grant Thornton' },
-      { domain: 'bakertilly.ca', name: 'Baker Tilly' },
-      { domain: 'welchllp.com', name: 'Welch LLP' },
-      { domain: 'crowe.com', name: 'Crowe' },
+      { domain: 'bdo.ca', name: 'BDO Canada', teamPages: ['/en-ca/our-people/search-results?name='] },
+      { domain: 'mnp.ca', name: 'MNP LLP', teamPages: ['/en/find-a-team-member?search='] },
+      { domain: 'grantthornton.ca', name: 'Grant Thornton', teamPages: ['/en/people?search='] },
+      { domain: 'bakertilly.ca', name: 'Baker Tilly', teamPages: ['/en/people?q='] },
+      { domain: 'welchllp.com', name: 'Welch LLP', teamPages: ['/our-team/', '/about/our-team/'] },
+      { domain: 'manningelliott.com', name: 'Manning Elliott', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'smythegroup.com', name: 'Smythe LLP', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'dmcl.ca', name: 'DMCL', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'clearlinecpa.ca', name: 'Clearline CPA', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'rcmycpa.ca', name: 'RCM CPA', teamPages: ['/team/', '/our-team/'] },
     ];
 
-    // Try email pattern guessing for large firms
     for (const firm of largeFirms) {
-      // Common email patterns: first.last@domain, flast@domain
-      const patterns = [];
-      if (firstName && lastName) {
-        patterns.push(`${firstName.toLowerCase()}.${lastName.toLowerCase()}@${firm.domain}`);
-        patterns.push(`${firstName[0].toLowerCase()}${lastName.toLowerCase()}@${firm.domain}`);
-      }
-
-      for (const emailGuess of patterns) {
+      for (const teamPath of firm.teamPages) {
         try {
-          // Verify the domain's MX records exist (indicates email service)
-          const response = await axios.get(`https://${firm.domain}`, {
-            timeout: 5000,
+          // Build URL: for search-based pages, append the last name
+          let url;
+          if (teamPath.includes('?') || teamPath.includes('=')) {
+            url = `https://${firm.domain}${teamPath}${encodeURIComponent(lastNameClean)}`;
+          } else {
+            url = `https://${firm.domain}${teamPath}`;
+          }
+
+          const response = await axios.get(url, {
+            timeout: 8000,
             headers: { 'User-Agent': this.userAgent },
-            maxRedirects: 2,
-            validateStatus: () => true,
+            maxRedirects: 3,
+            validateStatus: (s) => s < 400,
           });
-          if (response.status < 500) {
-            // Domain exists and serves content — email pattern is plausible but not verified
-            // We won't use unverified email guesses — only real emails found on pages
-            break;
+
+          const html = response.data;
+          // Check if the page mentions the CPA's name
+          const htmlLower = html.toLowerCase();
+          if (htmlLower.includes(lastNameClean) && htmlLower.includes(firstName)) {
+            // Found a name match — look for emails on this page
+            const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+            const foundEmails = html.match(emailRegex) || [];
+
+            for (const email of foundEmails) {
+              if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
+              if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail|info|admin|support|contact|reception|office|careers|hr|hello|general|webmaster|noreply|no-reply)@/i)) continue;
+              if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.)/i)) continue;
+              if (email.split('@')[0].length < 3) continue;
+
+              const emailLower = email.toLowerCase();
+              const localPart = emailLower.split('@')[0];
+              // Check if email contains the CPA's name parts
+              if (localPart.includes(lastNameClean) || localPart.includes(firstName)) {
+                console.log(`[Enrichment] Found name-matched email for ${cpa.full_name}: ${email} on ${firm.name}`);
+                return { email, source: `firm_directory:${firm.name}`, firmName: firm.name };
+              }
+            }
+
+            // If we found the name but no name-matched email, try pattern-based emails
+            // Common patterns: first.last@domain, flast@domain
+            const candidateEmails = [
+              `${firstName}.${lastNameClean}@${firm.domain}`,
+              `${firstName[0]}${lastNameClean}@${firm.domain}`,
+              `${firstName}${lastNameClean}@${firm.domain}`,
+            ];
+
+            // Check if any of these patterns appear in the found emails
+            for (const candidate of candidateEmails) {
+              if (foundEmails.map(e => e.toLowerCase()).includes(candidate)) {
+                console.log(`[Enrichment] Found pattern-matched email for ${cpa.full_name}: ${candidate} on ${firm.name}`);
+                return { email: candidate, source: `firm_directory:${firm.name}`, firmName: firm.name };
+              }
+            }
           }
         } catch (err) {
-          break;
+          // Page doesn't exist or error — skip this firm/path
+          continue;
         }
+        await delay(2000); // Delay between firm page fetches
       }
     }
 
