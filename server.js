@@ -828,11 +828,12 @@ class CPABCScraper {
 // =====================================================
 // All these provinces use ASP.NET iMIS with Telerik RadGrid
 class IMISDirectoryScraper {
-  constructor({ source, province, searchUrl, lastNameFieldIndex, userAgent }) {
+  constructor({ source, province, searchUrl, lastNameFieldIndex, userAgent, exactMatchOnly }) {
     this.source = source;
     this.province = province;
     this.searchUrl = searchUrl;
     this.lastNameFieldIndex = lastNameFieldIndex || 0; // which Input# is the last name
+    this.exactMatchOnly = exactMatchOnly || false; // if true, use common names instead of 2-letter prefixes
     this.userAgent = userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   }
 
@@ -959,18 +960,33 @@ class IMISDirectoryScraper {
 
       const lastNameField = textInputs[this.lastNameFieldIndex] || textInputs[0];
       console.log(`[${this.source}] Using last name field: ${lastNameField}`);
+      console.log(`[${this.source}] Search mode: ${this.exactMatchOnly ? 'exact match (common names)' : '2-letter prefixes'}`);
 
-      // Step 2: Iterate using 2-letter prefixes
-      const letters = 'abcdefghijklmnopqrstuvwxyz';
-      let searchCount = 0;
+      // Step 2: Build search terms list
+      let searchTerms;
+      if (this.exactMatchOnly) {
+        // For directories that require exact last name match, use common Canadian last names
+        searchTerms = COMMON_CANADIAN_LAST_NAMES;
+      } else {
+        // Use 2-letter prefixes for partial match directories
+        const letters = 'abcdefghijklmnopqrstuvwxyz';
+        searchTerms = [];
+        for (let i = 0; i < letters.length; i++) {
+          for (let j = 0; j < letters.length; j++) {
+            searchTerms.push(letters[i] + letters[j]);
+          }
+        }
+      }
 
-      for (let i = 0; i < letters.length; i++) {
-        for (let j = 0; j < letters.length; j++) {
-          const prefix = letters[i] + letters[j];
-          searchCount++;
+      for (let searchIdx = 0; searchIdx < searchTerms.length; searchIdx++) {
+          const searchTerm = searchTerms[searchIdx];
 
-          if (j === 0) {
-            console.log(`[${this.source}] Searching "${letters[i]}*" prefixes (${searchCount}/676)... Found: ${totalFound}, Inserted: ${totalInserted}`);
+          if (this.exactMatchOnly) {
+            if (searchIdx % 10 === 0) {
+              console.log(`[${this.source}] Progress: ${searchIdx}/${searchTerms.length} names... Found: ${totalFound}, Inserted: ${totalInserted}`);
+            }
+          } else if (searchIdx % 26 === 0) {
+            console.log(`[${this.source}] Searching "${searchTerm[0]}*" prefixes (${searchIdx + 1}/${searchTerms.length})... Found: ${totalFound}, Inserted: ${totalInserted}`);
           }
 
           try {
@@ -982,7 +998,7 @@ class IMISDirectoryScraper {
             for (const input of textInputs) {
               formData.set(input, '');
             }
-            formData.set(lastNameField, prefix);
+            formData.set(lastNameField, searchTerm);
             formData.set(submitButton, submitButtonValue);
             formData.delete('ctl01$ScriptManager1');
             formData.delete('ctl00$ScriptManager1');
@@ -1022,7 +1038,7 @@ class IMISDirectoryScraper {
             }
           } catch (err) {
             consecutiveErrors++;
-            if (consecutiveErrors <= 3) console.error(`[${this.source}] Error for "${prefix}":`, err.message);
+            if (consecutiveErrors <= 3) console.error(`[${this.source}] Error for "${searchTerm}":`, err.message);
             if (consecutiveErrors >= 5) {
               console.log(`[${this.source}] Re-establishing session...`);
               try {
@@ -1036,7 +1052,6 @@ class IMISDirectoryScraper {
             }
           }
           await delay(3000);
-        }
       }
 
       await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
@@ -1071,6 +1086,7 @@ const cpaSKScraper = new IMISDirectoryScraper({
   source: 'cpask', province: 'SK',
   searchUrl: 'https://member.cpask.ca/CPASK/Member-Firm-Search-Pages/Find_a_CPA_Member.aspx',
   lastNameFieldIndex: 0, // Input0=LastName, Input1=FirstName, Input2=InformalName
+  exactMatchOnly: true, // SK requires exact last name match
 });
 
 const cpaNSScraper = new IMISDirectoryScraper({
