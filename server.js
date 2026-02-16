@@ -1705,12 +1705,43 @@ class CorporationsCanadaAPI {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      // Search by common business name prefixes — each returns up to ~50 results
-      const searchTerms = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+      // Search requires minimum 3 characters, returns max 20 per page
+      // Use focused search terms: common Canadian business prefixes and province-related terms
+      const searchTerms = [
+        // Common business structure words
+        'Inc', 'Ltd', 'Corp', 'Group', 'Holdings', 'Capital', 'Ventures', 'Services',
+        'Solutions', 'Management', 'Consulting', 'Global', 'National', 'International',
+        'Industries', 'Enterprises', 'Development', 'Properties', 'Investment', 'Financial',
+        'Technology', 'Digital', 'Media', 'Energy', 'Resources', 'Mining', 'Construction',
+        // Canada-specific
+        'Canada', 'Canadian', 'Dominion', 'Federal', 'Pacific', 'Atlantic', 'Northern',
+        'Western', 'Eastern', 'Trans', 'Rocky', 'Maple', 'Arctic', 'Prairie',
+        // Province names
+        'Ontario', 'Quebec', 'Alberta', 'British', 'Manitoba', 'Saskatchewan', 'Nova',
+        'Brunswick', 'Newfoundland', 'Prince', 'Yukon', 'Northwest',
+        // City names (major)
+        'Toronto', 'Montreal', 'Vancouver', 'Calgary', 'Edmonton', 'Ottawa', 'Winnipeg',
+        'Hamilton', 'Halifax', 'Victoria', 'Saskatoon', 'Regina', 'Mississauga',
+        // Industry terms
+        'Health', 'Pharma', 'Bio', 'Medical', 'Food', 'Restaurant', 'Hotel', 'Travel',
+        'Auto', 'Transport', 'Logistics', 'Insurance', 'Real', 'Estate', 'Legal',
+        'Engineering', 'Architecture', 'Design', 'Marketing', 'Software', 'Cloud',
+        'Data', 'Security', 'Clean', 'Green', 'Solar', 'Wind', 'Oil', 'Gas', 'Petro',
+        'Agri', 'Farm', 'Forest', 'Fish', 'Ocean', 'Marine',
+        // Common 3-letter combos that match many businesses
+        'AAA', 'ABC', 'ACE', 'ALL', 'BAY', 'BIG', 'CAN', 'CAP', 'COM', 'CON',
+        'DYN', 'ECO', 'EXP', 'FIN', 'GEN', 'GOL', 'HIG', 'HUB', 'IMM', 'INN',
+        'KEY', 'LAK', 'LIN', 'MAX', 'MER', 'MID', 'NET', 'NEW', 'NOR', 'ONE',
+        'OPT', 'PAC', 'PEA', 'PIN', 'POW', 'PRE', 'PRO', 'QUA', 'RED', 'ROY',
+        'SKY', 'SOL', 'STA', 'SUN', 'TEC', 'TOP', 'TRI', 'UNI', 'VAN', 'WES',
+      ];
+      console.log(`[CorpsCan] Will search ${searchTerms.length} terms`);
 
       for (let si = 0; si < searchTerms.length; si++) {
         const prefix = searchTerms[si];
-        console.log(`[CorpsCan] Searching prefix "${prefix}" (${si + 1}/26)... Found: ${totalFound}, Inserted: ${totalInserted}`);
+        if (si % 20 === 0) {
+          console.log(`[CorpsCan] Progress: ${si}/${searchTerms.length} terms... Found: ${totalFound}, Inserted: ${totalInserted}`);
+        }
 
         try {
           // POST to legacy search form
