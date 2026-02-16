@@ -1688,11 +1688,15 @@ class CPAScraperOrchestrator {
 // 🏢 SME DATA COLLECTION
 // =====================================================
 
-// 3A. Corporations Canada API Client
+// 3A. Corporations Canada — Legacy HTML form scraper + JSON detail API
+// No public REST search API exists. We POST to the legacy search form,
+// parse result links to extract corpIds, then fetch JSON details.
 class CorporationsCanadaAPI {
   constructor() {
-    this.baseUrl = 'https://api.ised-isde.canada.ca/api/cc/v1';
+    this.searchUrl = 'https://ised-isde.canada.ca/cc/lgcy/fdrlCrpSrch.html?locale=en_CA';
+    this.detailUrl = 'https://ised-isde.canada.ca/cc/lgcy/api/corporations';
     this.source = 'corporations_canada';
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   }
 
   async scrape(dbClient) {
@@ -1701,59 +1705,87 @@ class CorporationsCanadaAPI {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      // Search by common business name prefixes
-      const prefixes = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+      // Search by common business name prefixes — each returns up to ~50 results
+      const searchTerms = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 
-      for (const prefix of prefixes) {
-        let page = 1;
-        let hasMore = true;
+      for (let si = 0; si < searchTerms.length; si++) {
+        const prefix = searchTerms[si];
+        console.log(`[CorpsCan] Searching prefix "${prefix}" (${si + 1}/26)... Found: ${totalFound}, Inserted: ${totalInserted}`);
 
-        while (hasMore) {
-          try {
-            const response = await axios.get(`${this.baseUrl}/corporationsSearch`, {
-              params: { searchTerm: prefix, page, pageSize: 100 },
-              headers: { 'User-Agent': 'CanadaAccountants-DataCollection/1.0' },
-              timeout: 15000,
-            });
+        try {
+          // POST to legacy search form
+          const formData = new URLSearchParams();
+          formData.append('corpName', prefix);
+          formData.append('corpNumber', '');
+          formData.append('busNumber', '');
+          formData.append('corpProvince', '');
+          formData.append('corpStatus', 'Active');
+          formData.append('corpAct', '');
+          formData.append('buttonNext', 'Search');
+          formData.append('_pageFlowMap', '');
+          formData.append('_page', '');
 
-            const corps = response.data?.corporations || response.data?.results || [];
-            if (corps.length === 0) { hasMore = false; break; }
+          const searchRes = await axios.post(this.searchUrl, formData.toString(), {
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'User-Agent': this.userAgent,
+              'Referer': this.searchUrl,
+            },
+            timeout: 30000,
+            maxRedirects: 5,
+          });
 
-            totalFound += corps.length;
+          // Parse HTML to extract corporation IDs from result links
+          const $ = cheerio.load(searchRes.data);
+          const corpIds = [];
+          $('a[href*="fdrlCrpDtls.html"]').each((_, el) => {
+            const href = $(el).attr('href') || '';
+            const match = href.match(/corpId=(\d+)/);
+            if (match) corpIds.push(match[1]);
+          });
 
-            for (const corp of corps) {
-              // Map province codes
-              const province = corp.province || corp.jurisdictionOfIncorporation || '';
+          totalFound += corpIds.length;
 
-              // Check for duplicate by corporate number
-              if (corp.corporationNumber) {
-                const existing = await dbClient.query(
-                  'SELECT id FROM scraped_smes WHERE corporate_number = $1',
-                  [corp.corporationNumber]
-                );
-                if (existing.rows.length > 0) { totalSkipped++; continue; }
-              }
+          // Fetch JSON details for each corporation
+          for (const corpId of corpIds) {
+            try {
+              const detailRes = await axios.get(`${this.detailUrl}/${corpId}.json?lang=eng`, {
+                headers: { 'User-Agent': this.userAgent },
+                timeout: 10000,
+              });
+
+              const data = Array.isArray(detailRes.data) ? detailRes.data[0] : detailRes.data;
+              if (!data) continue;
+
+              const corpName = data.corporationNames?.[0]?.CorporationName?.name || '';
+              const corpNumber = data.corporationId || corpId;
+              const province = data.adresses?.[0]?.address?.provinceCode || '';
+              const status = data.status || 'Active';
+              const city = data.adresses?.[0]?.address?.city || '';
+
+              // Check for duplicate
+              const existing = await dbClient.query(
+                'SELECT id FROM scraped_smes WHERE corporate_number = $1',
+                [corpNumber.toString()]
+              );
+              if (existing.rows.length > 0) { totalSkipped++; continue; }
 
               await dbClient.query(
-                `INSERT INTO scraped_smes (source, business_name, corporate_number, province, business_status, incorporation_date, scrape_job_id)
+                `INSERT INTO scraped_smes (source, business_name, corporate_number, province, city, business_status, scrape_job_id)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                [this.source, corp.corporationName || corp.name || '', corp.corporationNumber || '',
-                 province, corp.status || 'active', corp.incorporationDate || null, jobId]
+                [this.source, corpName, corpNumber.toString(), province, city, status, jobId]
               );
               totalInserted++;
+            } catch (detailErr) {
+              // Skip individual detail errors
             }
-
-            // Check if there are more pages
-            if (corps.length < 100) hasMore = false;
-            else page++;
-
-          } catch (err) {
-            console.error(`[CorpsCan] Error for prefix "${prefix}" page ${page}:`, err.message);
-            hasMore = false;
+            await delay(500); // 0.5s between detail requests
           }
-
-          await delay(2000); // 2-second delay
+        } catch (err) {
+          console.error(`[CorpsCan] Error for prefix "${prefix}":`, err.message);
         }
+
+        await delay(3000);
       }
 
       await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
@@ -1772,9 +1804,12 @@ class CorporationsCanadaAPI {
 }
 
 // 3B. Statistics Canada ODBus Business Register Loader
+// Downloads ZIP from StatCan, extracts CSV, loads 446K+ businesses
+const AdmZip = require('adm-zip');
+
 class StatCanODBusLoader {
   constructor() {
-    this.csvUrl = 'https://open.canada.ca/data/dataset/c8045914-7a51-4171-a321-968e4a8dbdc3/resource/d45cca34-0d16-43f5-a533-e71c1a0e0f0a/download/odbus.csv';
+    this.zipUrl = 'https://www150.statcan.gc.ca/n1/pub/21-26-0003/2023001/ODBus_2023.zip';
     this.source = 'statcan_odbus';
   }
 
@@ -1804,48 +1839,80 @@ class StatCanODBusLoader {
 
   static naicsToIndustry(code) {
     if (!code) return 'Unknown';
-    const prefix2 = code.substring(0, 2);
+    const prefix2 = String(code).substring(0, 2);
     return StatCanODBusLoader.NAICS_MAP[prefix2] || 'Other';
   }
 
   async load(dbClient) {
-    console.log('🔍 Starting StatCan ODBus CSV load...');
+    console.log('🔍 Starting StatCan ODBus ZIP download...');
     const jobId = await this._startJob(dbClient);
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      // Download CSV
-      const response = await axios.get(this.csvUrl, {
-        responseType: 'text',
-        timeout: 120000, // 2 minute timeout for large file
+      // Download ZIP file (21MB)
+      console.log('[ODBus] Downloading ZIP file (~21MB)...');
+      const response = await axios.get(this.zipUrl, {
+        responseType: 'arraybuffer',
+        timeout: 300000, // 5 minute timeout for large file
         headers: { 'User-Agent': 'CanadaAccountants-DataCollection/1.0' },
       });
+      console.log(`[ODBus] Downloaded ${(response.data.byteLength / 1048576).toFixed(1)}MB`);
 
-      const lines = response.data.split('\n');
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+      // Extract CSV from ZIP
+      const zip = new AdmZip(Buffer.from(response.data));
+      const entries = zip.getEntries();
+      const csvEntry = entries.find(e => e.entryName.endsWith('.csv') && e.entryName.includes('ODBus_v1'));
+      if (!csvEntry) {
+        // Fallback: find any large CSV
+        const anyCsv = entries.find(e => e.entryName.endsWith('.csv') && e.getData().length > 1000000);
+        if (!anyCsv) throw new Error('Could not find ODBus CSV in ZIP archive. Entries: ' + entries.map(e => e.entryName).join(', '));
+        console.log(`[ODBus] Using fallback CSV: ${anyCsv.entryName}`);
+      }
 
-      // Process in batches of 100
+      const csvData = (csvEntry || entries.find(e => e.entryName.endsWith('.csv') && e.getData().length > 1000000)).getData().toString('utf8');
+      const lines = csvData.split('\n');
+      console.log(`[ODBus] CSV has ${lines.length} lines`);
+
+      // Parse header — actual columns: idx, business_name, alt_business_name, business_sector,
+      // business_subsector, business_description, business_id_no, licence_number, licence_type,
+      // derived_NAICS, source_NAICS_primary, source_NAICS_secondary, NAICS_descr, NAICS_descr2,
+      // latitude, longitude, full_address, postal_code, unit, street_no, street_name,
+      // street_direction, street_type, city, prov_terr, total_no_employees, status,
+      // provider, geo_source, CSDUID, CSDNAME, PRUID
+      const rawHeaders = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      console.log(`[ODBus] Columns: ${rawHeaders.slice(0, 10).join(', ')}...`);
+
+      // Build column index map
+      const colIdx = {};
+      rawHeaders.forEach((h, i) => { colIdx[h] = i; });
+
+      // Process in batches
       const batch = [];
       for (let i = 1; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
 
         totalFound++;
-        const cols = line.split(',').map(c => c.trim().replace(/"/g, ''));
 
-        // Map CSV columns (adjust indices based on actual CSV structure)
-        const record = {};
-        headers.forEach((h, idx) => { record[h.toLowerCase()] = cols[idx] || ''; });
+        // Parse CSV line (handle quoted fields with commas)
+        const cols = this._parseCSVLine(line);
 
-        const businessName = record.business_name || record.name || record.legal_name || cols[0] || '';
-        const naicsCode = record.naics || record.naics_code || cols[1] || '';
-        const province = record.province || record.prov || cols[2] || '';
+        const businessName = cols[colIdx['business_name']] || '';
+        const naicsCode = cols[colIdx['derived_naics']] || cols[colIdx['source_naics_primary']] || '';
+        const naicsDescr = cols[colIdx['naics_descr']] || '';
+        const province = cols[colIdx['prov_terr']] || '';
+        const city = cols[colIdx['city']] || '';
+        const status = cols[colIdx['status']] || 'Active';
+        const employees = cols[colIdx['total_no_employees']] || '';
 
-        if (!businessName) continue;
+        if (!businessName || businessName.length < 2) continue;
 
-        batch.push({ businessName, naicsCode, province });
+        batch.push({ businessName, naicsCode, naicsDescr, province, city, status, employees });
 
-        if (batch.length >= 100) {
+        if (batch.length >= 500) {
+          if (totalFound % 50000 === 0) {
+            console.log(`[ODBus] Progress: ${totalFound} processed, ${totalInserted} inserted, ${totalSkipped} skipped`);
+          }
           const result = await this._insertBatch(dbClient, batch, jobId);
           totalInserted += result.inserted;
           totalSkipped += result.skipped;
@@ -1861,7 +1928,7 @@ class StatCanODBusLoader {
       }
 
       await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
-      console.log(`✅ StatCan ODBus load complete: ${totalFound} found, ${totalInserted} inserted`);
+      console.log(`✅ StatCan ODBus load complete: ${totalFound} found, ${totalInserted} inserted, ${totalSkipped} skipped`);
     } catch (error) {
       await this._failJob(dbClient, jobId, error.message);
       console.error('❌ StatCan ODBus load failed:', error.message);
@@ -1870,19 +1937,34 @@ class StatCanODBusLoader {
     return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
   }
 
+  // Simple CSV line parser that handles quoted fields
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
   async _insertBatch(dbClient, records, jobId) {
     let inserted = 0, skipped = 0;
     for (const rec of records) {
       try {
-        const industry = StatCanODBusLoader.naicsToIndustry(rec.naicsCode);
+        const industry = rec.naicsDescr || StatCanODBusLoader.naicsToIndustry(rec.naicsCode);
         await dbClient.query(
-          `INSERT INTO scraped_smes (source, business_name, naics_code, industry, province, business_status, scrape_job_id)
-           VALUES ($1, $2, $3, $4, $5, 'active', $6)`,
-          [this.source, rec.businessName, rec.naicsCode, industry, rec.province, jobId]
+          `INSERT INTO scraped_smes (source, business_name, naics_code, industry, province, city, business_status, scrape_job_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [this.source, rec.businessName, rec.naicsCode, industry, rec.province, rec.city, rec.status, jobId]
         );
         inserted++;
       } catch (err) {
-        skipped++;
+        skipped++; // duplicate or constraint error
       }
     }
     return { inserted, skipped };
