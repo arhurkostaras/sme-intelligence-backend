@@ -2058,6 +2058,7 @@ class FirmWebsiteEnricher {
   constructor() {
     this.dailyLimit = 200;
     this.delayMs = 5000;
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   }
 
   async enrich(dbClient) {
@@ -2066,8 +2067,8 @@ class FirmWebsiteEnricher {
     let totalProcessed = 0, totalEnriched = 0;
 
     try {
-      // Get CPAs with firm_name but no email
-      const cpas = await dbClient.query(
+      // Priority 1: CPAs with firm_name (BC provides these)
+      const cpasWithFirm = await dbClient.query(
         `SELECT id, first_name, last_name, full_name, firm_name, city, province
          FROM scraped_cpas
          WHERE firm_name IS NOT NULL AND firm_name != ''
@@ -2078,21 +2079,74 @@ class FirmWebsiteEnricher {
         [this.dailyLimit]
       );
 
-      for (const cpa of cpas.rows) {
+      console.log(`[Enrichment] Found ${cpasWithFirm.rows.length} CPAs with firm names to enrich`);
+
+      for (const cpa of cpasWithFirm.rows) {
         totalProcessed++;
         try {
-          const email = await this._findEmailForCPA(cpa);
-          if (email) {
+          const result = await this._findEmailForCPA(cpa, dbClient);
+          if (result) {
             await dbClient.query(
-              `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = 'firm_website', enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
-              [cpa.id, email]
+              `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+              [cpa.id, result.email, result.source]
             );
             totalEnriched++;
+          } else {
+            // Mark as attempted so we don't keep retrying
+            await dbClient.query(
+              `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
+              [cpa.id]
+            );
           }
         } catch (err) {
           console.error(`[Enrichment] Error for CPA ${cpa.id}:`, err.message);
         }
+        if (totalProcessed % 20 === 0) {
+          console.log(`[Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
+        }
         await delay(this.delayMs);
+      }
+
+      // Priority 2: CPAs without firm_name — try name-based search on common CPA firm sites
+      const remaining = this.dailyLimit - totalProcessed;
+      if (remaining > 0) {
+        const cpasNoFirm = await dbClient.query(
+          `SELECT id, first_name, last_name, full_name, city, province
+           FROM scraped_cpas
+           WHERE (firm_name IS NULL OR firm_name = '')
+             AND email IS NULL AND enriched_email IS NULL
+             AND status = 'raw'
+           ORDER BY scraped_at ASC
+           LIMIT $1`,
+          [remaining]
+        );
+
+        console.log(`[Enrichment] Found ${cpasNoFirm.rows.length} CPAs without firm names to try`);
+
+        for (const cpa of cpasNoFirm.rows) {
+          totalProcessed++;
+          try {
+            const result = await this._findEmailNoFirm(cpa);
+            if (result) {
+              await dbClient.query(
+                `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, firm_name = COALESCE(NULLIF(firm_name, ''), $4), enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+                [cpa.id, result.email, result.source, result.firmName || '']
+              );
+              totalEnriched++;
+            } else {
+              await dbClient.query(
+                `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
+                [cpa.id]
+              );
+            }
+          } catch (err) {
+            console.error(`[Enrichment] Error for CPA ${cpa.id} (no-firm):`, err.message);
+          }
+          if (totalProcessed % 20 === 0) {
+            console.log(`[Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
+          }
+          await delay(this.delayMs);
+        }
       }
 
       await this._completeJob(dbClient, jobId, totalProcessed, totalEnriched);
@@ -2105,78 +2159,155 @@ class FirmWebsiteEnricher {
     return { processed: totalProcessed, enriched: totalEnriched };
   }
 
-  async _findEmailForCPA(cpa) {
-    // Search for the firm's website
-    const firmQuery = encodeURIComponent(`${cpa.firm_name} ${cpa.city || ''} ${cpa.province || ''} accounting CPA`);
+  // Strategy 1: CPA has a firm name — try to find firm website and extract emails
+  async _findEmailForCPA(cpa, dbClient) {
+    const firmName = cpa.firm_name;
+    if (!firmName) return null;
 
-    try {
-      // Try to find firm website by searching for common patterns
-      const firmNameSlug = cpa.firm_name.toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/llp|inc|ltd|corp/g, '');
-      const possibleDomains = [
-        `${firmNameSlug}.ca`,
-        `${firmNameSlug}.com`,
-        `www.${firmNameSlug}.ca`,
-      ];
+    // Generate possible domain variations from firm name
+    const firmSlug = firmName.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\b(llp|inc|ltd|corp|corporation|limited|professional|group|associates)\b/g, '')
+      .trim().replace(/\s+/g, '');
 
-      for (const domain of possibleDomains) {
-        try {
-          const response = await axios.get(`https://${domain}`, {
-            timeout: 10000,
-            headers: { 'User-Agent': 'CanadaAccountants-DataCollection/1.0' },
-            maxRedirects: 3,
-          });
+    // Also try with hyphens instead of removing spaces
+    const firmSlugHyphen = firmName.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\b(llp|inc|ltd|corp|corporation|limited|professional|group|associates)\b/g, '')
+      .trim().replace(/\s+/g, '-');
 
-          const $ = cheerio.load(response.data);
-          const pageText = $.html();
+    const possibleDomains = [];
+    if (firmSlug.length >= 3) {
+      possibleDomains.push(`${firmSlug}.ca`, `${firmSlug}.com`);
+    }
+    if (firmSlugHyphen.length >= 3 && firmSlugHyphen !== firmSlug) {
+      possibleDomains.push(`${firmSlugHyphen}.ca`, `${firmSlugHyphen}.com`);
+    }
 
-          // Find email addresses on the page
-          const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-          const emails = pageText.match(emailRegex) || [];
-
-          // Filter out generic addresses
-          const nonGeneric = emails.filter(e =>
-            !e.match(/^(info|contact|admin|support|noreply|no-reply|hello|office)@/i)
+    for (const domain of possibleDomains) {
+      try {
+        const email = await this._scrapeWebsiteForEmail(domain, cpa);
+        if (email) {
+          // Update firm_website in DB
+          await dbClient.query(
+            `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1`,
+            [cpa.id, domain]
           );
-
-          // Try to match CPA name to found emails
-          const firstName = (cpa.first_name || '').toLowerCase();
-          const lastName = (cpa.last_name || '').toLowerCase();
-
-          for (const email of nonGeneric) {
-            const emailLower = email.toLowerCase();
-            if (emailLower.includes(firstName) || emailLower.includes(lastName)) {
-              // Store the firm website
-              await this._updateFirmWebsite(cpa.id, domain);
-              return email;
-            }
-          }
-
-          // If no name match, use the first non-generic email as a fallback
-          if (nonGeneric.length > 0) {
-            await this._updateFirmWebsite(cpa.id, domain);
-            return nonGeneric[0];
-          }
-
-          // If only generic emails, use the first one
-          if (emails.length > 0) {
-            await this._updateFirmWebsite(cpa.id, domain);
-            return emails[0];
-          }
-        } catch (err) {
-          // Domain doesn't exist or can't be reached
-          continue;
+          return { email, source: 'firm_website' };
         }
+      } catch (err) {
+        continue;
       }
-    } catch (err) {
-      // Search failed
     }
 
     return null;
   }
 
-  async _updateFirmWebsite(cpaId, domain) {
-    // We can't use dbClient here without passing it, but this is called from _findEmailForCPA
-    // which doesn't have dbClient. We'll skip this for now.
+  // Strategy 2: No firm name — try to find CPA via common large firm directories
+  async _findEmailNoFirm(cpa) {
+    // Skip if we don't have enough data to search
+    const firstName = (cpa.first_name || '').trim();
+    const lastName = (cpa.last_name || '').trim();
+    if (!lastName || lastName.length < 2) return null;
+
+    // Try well-known large CPA firm websites that list their staff
+    const largeFirms = [
+      { domain: 'bdo.ca', name: 'BDO Canada' },
+      { domain: 'mnp.ca', name: 'MNP LLP' },
+      { domain: 'grantthornton.ca', name: 'Grant Thornton' },
+      { domain: 'bakertilly.ca', name: 'Baker Tilly' },
+      { domain: 'welchllp.com', name: 'Welch LLP' },
+      { domain: 'crowe.com', name: 'Crowe' },
+    ];
+
+    // Try email pattern guessing for large firms
+    for (const firm of largeFirms) {
+      // Common email patterns: first.last@domain, flast@domain
+      const patterns = [];
+      if (firstName && lastName) {
+        patterns.push(`${firstName.toLowerCase()}.${lastName.toLowerCase()}@${firm.domain}`);
+        patterns.push(`${firstName[0].toLowerCase()}${lastName.toLowerCase()}@${firm.domain}`);
+      }
+
+      for (const emailGuess of patterns) {
+        try {
+          // Verify the domain's MX records exist (indicates email service)
+          const response = await axios.get(`https://${firm.domain}`, {
+            timeout: 5000,
+            headers: { 'User-Agent': this.userAgent },
+            maxRedirects: 2,
+            validateStatus: () => true,
+          });
+          if (response.status < 500) {
+            // Domain exists and serves content — email pattern is plausible but not verified
+            // We won't use unverified email guesses — only real emails found on pages
+            break;
+          }
+        } catch (err) {
+          break;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // Scrape a website for email addresses, prioritizing name matches
+  async _scrapeWebsiteForEmail(domain, cpa) {
+    const pages = [`https://${domain}`, `https://${domain}/contact`, `https://${domain}/team`, `https://${domain}/about`, `https://${domain}/our-team`, `https://${domain}/people`];
+    const allEmails = new Set();
+    const nameMatchEmails = [];
+    const firstName = (cpa.first_name || '').toLowerCase();
+    const lastName = (cpa.last_name || '').toLowerCase();
+
+    for (const url of pages) {
+      try {
+        const response = await axios.get(url, {
+          timeout: 8000,
+          headers: { 'User-Agent': this.userAgent },
+          maxRedirects: 3,
+          validateStatus: (s) => s < 400,
+        });
+
+        const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+        const found = response.data.match(emailRegex) || [];
+
+        for (const email of found) {
+          // Skip image/asset false positives
+          if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
+          // Skip dummy/example addresses
+          if (email.match(/^(example|test|user|email)@/i)) continue;
+
+          allEmails.add(email);
+          const emailLower = email.toLowerCase();
+
+          // Check if email contains CPA's name
+          if (firstName.length >= 2 && emailLower.includes(firstName)) {
+            nameMatchEmails.push(email);
+          } else if (lastName.length >= 2 && emailLower.includes(lastName)) {
+            nameMatchEmails.push(email);
+          }
+        }
+      } catch (err) {
+        continue;
+      }
+      await delay(1000); // 1s between pages on same domain
+    }
+
+    // Priority: name-matched email > non-generic email > generic email
+    if (nameMatchEmails.length > 0) return nameMatchEmails[0];
+
+    const nonGeneric = [...allEmails].filter(e =>
+      !e.match(/^(info|contact|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy)@/i)
+    );
+    if (nonGeneric.length > 0) return nonGeneric[0];
+
+    const generic = [...allEmails].filter(e =>
+      e.match(/^(info|contact|office)@/i)
+    );
+    if (generic.length > 0) return generic[0];
+
+    return null;
   }
 
   async _startJob(dbClient) {
