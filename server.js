@@ -1551,116 +1551,161 @@ class CPAQuebecScraper {
 // =====================================================
 class CPAOntarioScraper {
   constructor() {
-    this.baseUrl = 'https://myportal.cpaontario.ca/s/searchdirectory';
+    this.auraUrl = 'https://myportal.cpaontario.ca/s/sfsites/aura?r=1&aura.ApexAction.execute=1';
+    this.pageUrl = 'https://myportal.cpaontario.ca/s/searchdirectory';
     this.source = 'cpaontario';
     this.province = 'ON';
-    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.seenIds = new Set();
   }
 
   async scrape(dbClient) {
-    console.log('🔍 Starting CPA Ontario scrape (Salesforce Lightning)...');
+    console.log('🔍 Starting CPA Ontario scrape (Salesforce Aura API)...');
     const jobId = await this._startJob(dbClient);
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      // CPA Ontario uses Salesforce Lightning (SPA). We need to find the Aura API endpoint.
-      // Step 1: GET the page to extract the aura context/token
-      const pageRes = await axios.get(this.baseUrl, {
-        headers: { 'User-Agent': this.userAgent },
-        timeout: 20000, maxRedirects: 5,
-      });
+      // Step 1: Fetch the page to get the current fwuid
+      const fwuid = await this._getFwuid();
+      console.log(`[CPAOntario] Got fwuid: ${fwuid.substring(0, 20)}...`);
 
-      const html = pageRes.data;
-      let cookies = '';
-      const setCookies = pageRes.headers['set-cookie'];
-      if (setCookies) {
-        cookies = (Array.isArray(setCookies) ? setCookies : [setCookies])
-          .map(c => c.split(';')[0]).join('; ');
+      // Step 2: Build search terms — use last names plus supplementary terms
+      // The API does substring matching and caps at 2000 results per query
+      // We need specific enough terms to stay under 2000
+      const searchTerms = [
+        ...COMMON_CANADIAN_LAST_NAMES,
+        // Ontario city names for coverage
+        'Toronto', 'Ottawa', 'Mississauga', 'Brampton', 'Hamilton',
+        'London', 'Markham', 'Vaughan', 'Kitchener', 'Windsor',
+        'Richmond Hill', 'Oakville', 'Burlington', 'Oshawa', 'Barrie',
+        'St. Catharines', 'Guelph', 'Cambridge', 'Waterloo', 'Kingston',
+        'Thunder Bay', 'Sudbury', 'Peterborough', 'Newmarket', 'Ajax',
+        'Pickering', 'Whitby', 'Niagara', 'Scarborough', 'Etobicoke',
+        'North York', 'Kanata', 'Nepean', 'Stoney Creek', 'Brantford',
+        'Sarnia', 'Sault Ste', 'Belleville', 'Stratford', 'Woodstock',
+        'Timmins', 'North Bay', 'Cornwall', 'Chatham', 'Brockville',
+        // Common first names for extra coverage
+        'Michael', 'David', 'Robert', 'James', 'John', 'Richard', 'William',
+        'Jennifer', 'Sarah', 'Lisa', 'Susan', 'Karen', 'Jessica', 'Amanda',
+        'Christopher', 'Daniel', 'Matthew', 'Andrew', 'Steven', 'Kevin',
+        'Brian', 'Mark', 'Jason', 'Jeffrey', 'Timothy', 'Joseph', 'Anthony',
+        'Mohamed', 'Muhammad', 'Ahmed', 'Ali', 'Hassan', 'Priya', 'Raj',
+        'Deepak', 'Sanjay', 'Anand', 'Ravi', 'Amit', 'Arun', 'Vijay',
+        // Additional surnames for coverage
+        'Murphy', 'Sullivan', 'Collins', 'Kelly', 'Walsh', 'Lynch',
+        'Sharma', 'Gupta', 'Kumar', 'Das', 'Nair', 'Reddy', 'Rao',
+        'Cheng', 'Zhao', 'Zhou', 'Sun', 'Ma', 'Zhu', 'Hu',
+        'Khan', 'Sheikh', 'Hussain', 'Malik', 'Amir',
+        'Peters', 'Spencer', 'Long', 'Fox', 'Stone', 'Porter', 'Hunter',
+        'Mason', 'Cole', 'Webb', 'Palmer', 'Arnold', 'Harvey', 'Pearson',
+        'Dunn', 'Todd', 'Floyd', 'May', 'Lambert', 'Tucker', 'Burke',
+        'Barrett', 'Dixon', 'Payne', 'Henry', 'George', 'Wallace', 'Rhodes',
+        'Black', 'Hart', 'Hopkins', 'Saunders', 'Matthews', 'Barnes',
+        'Deloitte', 'KPMG', 'Ernst', 'PricewaterhouseCoopers', 'BDO',
+        'MNP', 'Grant Thornton', 'RSM', 'Baker Tilly', 'Crowe',
+        'Doane', 'Richter', 'Welch', 'Collins Barrow', 'Durward',
+        // Accounting/CPA-specific terms
+        'CGA', 'CMA', 'Chartered',
+      ];
+
+      // Remove duplicates (case-insensitive)
+      const uniqueTerms = [];
+      const seen = new Set();
+      for (const term of searchTerms) {
+        const lower = term.toLowerCase();
+        if (!seen.has(lower)) {
+          seen.add(lower);
+          uniqueTerms.push(term);
+        }
       }
 
-      // Try to extract Aura framework token and context from the page
-      const auraTokenMatch = html.match(/auraConfig\s*=\s*\{[^}]*"token"\s*:\s*"([^"]+)"/);
-      const auraContextMatch = html.match(/"auraContext"\s*:\s*(\{[^}]+\})/);
+      console.log(`[CPAOntario] Will search ${uniqueTerms.length} terms via Aura API`);
 
-      if (!auraTokenMatch) {
-        console.log('[CPAOntario] Could not extract Aura token - Salesforce SPA requires browser-like access');
-        console.log('[CPAOntario] Falling back to common name search via GET requests...');
-      }
-
-      // Fallback: try loading with search params which may server-render some results
-      const longNames = COMMON_CANADIAN_LAST_NAMES.filter(n => n.length >= 4);
-
-      for (let idx = 0; idx < longNames.length; idx++) {
-        const lastName = longNames[idx];
-        if (idx % 20 === 0) {
-          console.log(`[CPAOntario] Progress: ${idx}/${longNames.length} names... Found: ${totalFound}, Inserted: ${totalInserted}`);
+      for (let idx = 0; idx < uniqueTerms.length; idx++) {
+        const term = uniqueTerms[idx];
+        if (idx % 25 === 0) {
+          console.log(`[CPAOntario] Progress: ${idx}/${uniqueTerms.length} terms | Found: ${totalFound} | Inserted: ${totalInserted} | Unique IDs: ${this.seenIds.size}`);
         }
 
         try {
-          const response = await axios.get(this.baseUrl, {
-            params: { lastName },
-            headers: {
-              'User-Agent': this.userAgent,
-              'Cookie': cookies,
-            },
-            timeout: 20000, maxRedirects: 5,
-          });
+          // Get count first
+          const count = await this._auraCall(fwuid, 'getContactsCount', { searchString: term });
+          if (count === 0) continue;
 
-          const $ = cheerio.load(response.data);
+          const effectiveCount = Math.min(count, 2000);
+          if (count >= 2000) {
+            console.log(`[CPAOntario] Warning: "${term}" returned 2000 (capped), some records may be missed`);
+          }
 
-          // Try to parse any server-rendered data or embedded JSON
-          $('[data-record-id], .slds-table tbody tr, .directory-entry, table tbody tr').each((_, el) => {
-            const $row = $(el);
-            const cells = $row.find('td');
-            if (cells.length < 1) return;
-            const name = $(cells[0]).text().trim();
-            const city = cells.length > 1 ? $(cells[1]).text().trim() : '';
-            if (name && name.length > 3 && name.length < 80) {
+          // Paginate through results
+          const pageSize = 100;
+          const totalPages = Math.ceil(effectiveCount / pageSize);
+
+          for (let page = 1; page <= totalPages; page++) {
+            const records = await this._auraCall(fwuid, 'getContactsList', {
+              pagenumber: page,
+              numberOfRecords: effectiveCount,
+              pageSize,
+              searchString: term,
+            });
+
+            if (!records || !Array.isArray(records)) break;
+
+            for (const rec of records) {
+              const sfId = rec.Id;
+              if (!sfId || this.seenIds.has(sfId)) continue;
+              this.seenIds.add(sfId);
+
               totalFound++;
-              const nameHash = generateNameHash(name, this.province);
-              const parts = name.split(/\s+/);
-              this._insertRecord(dbClient, {
-                firstName: parts[0], lastName: parts.slice(1).join(' '),
-                fullName: name, city, nameHash, jobId
-              }).then(ok => ok ? totalInserted++ : totalSkipped++);
-            }
-          });
+              const fullName = rec.CPAO_CPA_Full_Legal_Name__c || '';
+              const designation = rec.CPAO_Designation__c || 'CPA';
+              const city = rec.CPAO_CPA_Employer_City__c || '';
+              const firmName = rec.CPAO_Employer_dir__c || '';
 
-          // Also check for JSON embedded in the page
-          const jsonMatches = response.data.match(/\{"records":\[.*?\]\}/g);
-          if (jsonMatches) {
-            for (const jsonStr of jsonMatches) {
-              try {
-                const data = JSON.parse(jsonStr);
-                if (data.records) {
-                  for (const rec of data.records) {
-                    const name = rec.Name || rec.name || '';
-                    const city = rec.City || rec.city || '';
-                    if (name) {
-                      totalFound++;
-                      const nameHash = generateNameHash(name, this.province);
-                      const parts = name.split(/\s+/);
-                      await this._insertRecord(dbClient, {
-                        firstName: parts[0], lastName: parts.slice(1).join(' '),
-                        fullName: name, city, nameHash, jobId
-                      }).then(ok => ok ? totalInserted++ : totalSkipped++);
-                    }
-                  }
-                }
-              } catch (parseErr) { /* skip invalid JSON */ }
+              if (!fullName || fullName.length < 3) continue;
+
+              // Parse "LastName, FirstName MiddleName" format
+              let firstName = '', lastName = '';
+              if (fullName.includes(',')) {
+                const parts = fullName.split(',').map(s => s.trim());
+                lastName = parts[0];
+                firstName = parts[1] ? parts[1].split(/\s+/)[0] : '';
+              } else {
+                const parts = fullName.split(/\s+/);
+                firstName = parts[0] || '';
+                lastName = parts.slice(1).join(' ') || '';
+              }
+
+              const nameHash = generateNameHash(fullName, this.province);
+              const ok = await this._insertRecord(dbClient, {
+                firstName, lastName, fullName, designation, city, firmName, nameHash, jobId
+              });
+              if (ok) totalInserted++;
+              else totalSkipped++;
             }
+
+            if (records.length < pageSize) break;
+            await delay(2000);
           }
         } catch (err) {
-          if (err.response?.status !== 403) console.error(`[CPAOntario] Error for "${lastName}":`, err.message);
+          console.error(`[CPAOntario] Error for "${term}":`, err.message);
+          // If fwuid expired, try refreshing it
+          if (err.message && err.message.includes('invalidSession')) {
+            console.log('[CPAOntario] Session expired, refreshing fwuid...');
+            try {
+              const newFwuid = await this._getFwuid();
+              Object.assign(this, { currentFwuid: newFwuid });
+              console.log('[CPAOntario] fwuid refreshed successfully');
+            } catch (refreshErr) {
+              console.error('[CPAOntario] Failed to refresh fwuid:', refreshErr.message);
+            }
+          }
         }
-        await delay(5000);
+        await delay(3000);
       }
 
       await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
-      console.log(`✅ CPA Ontario scrape complete: ${totalFound} found, ${totalInserted} inserted`);
-      if (totalFound === 0) {
-        console.log('[CPAOntario] Note: Salesforce Lightning SPAs require browser-level JavaScript execution. Consider using a headless browser for Ontario in the future.');
-      }
+      console.log(`✅ CPA Ontario scrape complete: ${totalFound} found, ${totalInserted} inserted, ${totalSkipped} skipped (${this.seenIds.size} unique Salesforce IDs)`);
     } catch (error) {
       await this._failJob(dbClient, jobId, error.message);
       console.error('❌ CPA Ontario scrape failed:', error.message);
@@ -1668,13 +1713,74 @@ class CPAOntarioScraper {
     return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
   }
 
-  async _insertRecord(dbClient, { firstName, lastName, fullName, city, nameHash, jobId }) {
+  async _getFwuid() {
+    const pageRes = await axios.get(this.pageUrl, {
+      headers: { 'User-Agent': this.userAgent },
+      timeout: 20000,
+    });
+    const match = pageRes.data.match(/"fwuid"\s*:\s*"([^"]+)"/);
+    if (!match) throw new Error('Could not extract fwuid from CPA Ontario page');
+    return match[1];
+  }
+
+  async _auraCall(fwuid, method, params) {
+    const message = JSON.stringify({
+      actions: [{
+        id: '1;a',
+        descriptor: 'aura://ApexActionController/ACTION$execute',
+        callingDescriptor: 'UNKNOWN',
+        params: {
+          namespace: 'c',
+          classname: 'MemberDirectoryController',
+          method,
+          params,
+          cacheable: true,
+          isContinuation: false,
+        },
+      }],
+    });
+
+    const context = JSON.stringify({
+      mode: 'PROD',
+      fwuid,
+      app: 'siteforce:communityApp',
+      loaded: { 'APPLICATION@markup://siteforce:communityApp': '1524_katkrDKC1KWstpeCt3iDPg' },
+    });
+
+    const body = new URLSearchParams();
+    body.append('message', message);
+    body.append('aura.context', context);
+    body.append('aura.token', 'undefined');
+
+    const response = await axios.post(this.auraUrl, body.toString(), {
+      headers: {
+        'User-Agent': this.userAgent,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': this.pageUrl,
+      },
+      timeout: 30000,
+    });
+
+    const data = response.data;
+    if (data.exceptionEvent) {
+      throw new Error(data.exceptionMessage || 'Aura exception');
+    }
+
+    const action = data.actions && data.actions[0];
+    if (!action || action.state !== 'SUCCESS') {
+      throw new Error(`Aura action failed: ${action?.state || 'no action'}`);
+    }
+
+    return action.returnValue.returnValue;
+  }
+
+  async _insertRecord(dbClient, { firstName, lastName, fullName, designation, city, firmName, nameHash, jobId }) {
     const existing = await dbClient.query('SELECT id FROM scraped_cpas WHERE name_hash = $1', [nameHash]);
     if (existing.rows.length > 0) return false;
     await dbClient.query(
-      `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, name_hash, scrape_job_id)
-       VALUES ($1, $2, $3, $4, 'CPA', $5, $6, $7, $8)`,
-      [this.source, firstName, lastName, fullName, this.province, city, nameHash, jobId]
+      `INSERT INTO scraped_cpas (source, first_name, last_name, full_name, designation, province, city, firm_name, name_hash, scrape_job_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [this.source, firstName, lastName, fullName, designation, this.province, city, firmName, nameHash, jobId]
     );
     return true;
   }
