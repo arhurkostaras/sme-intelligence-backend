@@ -2176,9 +2176,25 @@ class FirmWebsiteEnricher {
     this.dailyLimit = 500;
     this.delayMs = 3000;
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.running = false;
   }
 
   async enrich(dbClient) {
+    if (this.running) {
+      console.log('[Enrichment] Already running, skipping duplicate trigger');
+      return { processed: 0, enriched: 0 };
+    }
+    this.running = true;
+
+    // Clean up stale "running" jobs from previous server instances (older than 2 hours)
+    try {
+      const cleaned = await dbClient.query(
+        `UPDATE scrape_jobs SET status = 'failed', error_message = 'Server restarted — job orphaned', completed_at = NOW()
+         WHERE source = 'email_enrichment' AND status = 'running' AND started_at < NOW() - INTERVAL '2 hours'`
+      );
+      if (cleaned.rowCount > 0) console.log(`[Enrichment] Cleaned up ${cleaned.rowCount} stale jobs`);
+    } catch (e) { /* ignore */ }
+
     console.log('📧 Starting email enrichment pipeline...');
     const jobId = await this._startJob(dbClient);
     let totalProcessed = 0, totalEnriched = 0;
@@ -2273,6 +2289,7 @@ class FirmWebsiteEnricher {
       console.error('❌ Enrichment failed:', error.message);
     }
 
+    this.running = false;
     return { processed: totalProcessed, enriched: totalEnriched };
   }
 
@@ -2496,9 +2513,25 @@ class SMEEmailEnricher {
     this.dailyLimit = 300;
     this.delayMs = 3000;
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.running = false;
   }
 
   async enrich(dbClient) {
+    if (this.running) {
+      console.log('[SME Enrichment] Already running, skipping duplicate trigger');
+      return { processed: 0, enriched: 0 };
+    }
+    this.running = true;
+
+    // Clean up stale "running" jobs from previous server instances
+    try {
+      const cleaned = await dbClient.query(
+        `UPDATE scrape_jobs SET status = 'failed', error_message = 'Server restarted — job orphaned', completed_at = NOW()
+         WHERE source = 'sme_email_enrichment' AND status = 'running' AND started_at < NOW() - INTERVAL '2 hours'`
+      );
+      if (cleaned.rowCount > 0) console.log(`[SME Enrichment] Cleaned up ${cleaned.rowCount} stale jobs`);
+    } catch (e) { /* ignore */ }
+
     console.log('📧 Starting SME email enrichment pipeline...');
     const jobId = await this._startJob(dbClient);
     let totalProcessed = 0, totalEnriched = 0;
@@ -2554,6 +2587,7 @@ class SMEEmailEnricher {
       console.error('❌ SME Enrichment failed:', error.message);
     }
 
+    this.running = false;
     return { processed: totalProcessed, enriched: totalEnriched };
   }
 
