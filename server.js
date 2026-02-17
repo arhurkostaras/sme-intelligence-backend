@@ -2487,11 +2487,224 @@ class FirmWebsiteEnricher {
   }
 }
 
+// =====================================================
+// 📧 SME EMAIL ENRICHMENT PIPELINE
+// =====================================================
+
+class SMEEmailEnricher {
+  constructor() {
+    this.dailyLimit = 300;
+    this.delayMs = 3000;
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+
+  async enrich(dbClient) {
+    console.log('📧 Starting SME email enrichment pipeline...');
+    const jobId = await this._startJob(dbClient);
+    let totalProcessed = 0, totalEnriched = 0;
+
+    try {
+      // Get SMEs with business_name but no contact_email, not yet attempted
+      const smes = await dbClient.query(
+        `SELECT id, business_name, province, city, naics_code, industry, website
+         FROM scraped_smes
+         WHERE contact_email IS NULL
+           AND (status IS NULL OR status = 'raw' OR status = 'active')
+           AND business_name IS NOT NULL AND business_name != ''
+         ORDER BY scraped_at ASC
+         LIMIT $1`,
+        [this.dailyLimit]
+      );
+
+      console.log(`[SME Enrichment] Found ${smes.rows.length} SMEs to enrich`);
+
+      for (const sme of smes.rows) {
+        totalProcessed++;
+        try {
+          const result = await this._findEmailForSME(sme, dbClient);
+          if (result) {
+            await dbClient.query(
+              `UPDATE scraped_smes SET contact_email = $2, website = COALESCE(website, $3), enrichment_source = $4, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+              [sme.id, result.email, result.website || null, result.source]
+            );
+            totalEnriched++;
+          } else {
+            await dbClient.query(
+              `UPDATE scraped_smes SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
+              [sme.id]
+            );
+          }
+        } catch (err) {
+          console.error(`[SME Enrichment] Error for SME ${sme.id} (${sme.business_name}):`, err.message);
+          await dbClient.query(
+            `UPDATE scraped_smes SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
+            [sme.id]
+          );
+        }
+        if (totalProcessed % 20 === 0) {
+          console.log(`[SME Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
+        }
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalProcessed, totalEnriched);
+      console.log(`✅ SME Enrichment complete: ${totalProcessed} processed, ${totalEnriched} enriched`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ SME Enrichment failed:', error.message);
+    }
+
+    return { processed: totalProcessed, enriched: totalEnriched };
+  }
+
+  async _findEmailForSME(sme, dbClient) {
+    const businessName = sme.business_name;
+    if (!businessName) return null;
+
+    // Generate domain variations from business name
+    // Remove corporate suffixes and clean up
+    const cleaned = businessName.toLowerCase()
+      .replace(/\b(inc|ltd|llc|llp|corp|corporation|limited|co|company|enterprises|holdings|group|partners|solutions|services|consulting|technologies|international|canada|canadian|ontario|toronto|vancouver|calgary|ottawa|montreal)\b/gi, '')
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim();
+
+    if (cleaned.length < 3) return null;
+
+    // Generate slug variations
+    const words = cleaned.split(/\s+/).filter(w => w.length >= 2);
+    if (words.length === 0) return null;
+
+    const slug = words.join('');
+    const slugHyphen = words.join('-');
+    // First letters of each word (acronym)
+    const acronym = words.map(w => w[0]).join('');
+    // First two words only (common pattern)
+    const shortSlug = words.slice(0, 2).join('');
+    const shortSlugHyphen = words.slice(0, 2).join('-');
+
+    const possibleDomains = new Set();
+    // Priority order: .ca first (Canadian businesses), then .com
+    if (slug.length >= 3 && slug.length <= 40) {
+      possibleDomains.add(`${slug}.ca`);
+      possibleDomains.add(`${slug}.com`);
+    }
+    if (slugHyphen.length >= 3 && slugHyphen !== slug) {
+      possibleDomains.add(`${slugHyphen}.ca`);
+      possibleDomains.add(`${slugHyphen}.com`);
+    }
+    if (shortSlug.length >= 3 && shortSlug !== slug) {
+      possibleDomains.add(`${shortSlug}.ca`);
+      possibleDomains.add(`${shortSlug}.com`);
+    }
+    if (shortSlugHyphen.length >= 3 && shortSlugHyphen !== slugHyphen && shortSlugHyphen !== shortSlug) {
+      possibleDomains.add(`${shortSlugHyphen}.ca`);
+      possibleDomains.add(`${shortSlugHyphen}.com`);
+    }
+    // Acronyms only for 3+ letter ones to avoid too many false positives
+    if (acronym.length >= 3) {
+      possibleDomains.add(`${acronym}.ca`);
+      possibleDomains.add(`${acronym}.com`);
+    }
+
+    for (const domain of possibleDomains) {
+      try {
+        const email = await this._scrapeWebsiteForEmail(domain, sme);
+        if (email) {
+          return { email, website: `https://${domain}`, source: `website:${domain}` };
+        }
+      } catch (err) {
+        continue;
+      }
+    }
+
+    return null;
+  }
+
+  async _scrapeWebsiteForEmail(domain, sme) {
+    // For SMEs, we WANT generic emails (info@, contact@, office@) — we're emailing the business
+    const pages = [
+      `https://${domain}`,
+      `https://${domain}/contact`,
+      `https://${domain}/contact-us`,
+      `https://${domain}/about`,
+    ];
+    const allEmails = new Set();
+
+    for (const url of pages) {
+      try {
+        const response = await axios.get(url, {
+          timeout: 8000,
+          headers: { 'User-Agent': this.userAgent },
+          maxRedirects: 3,
+          validateStatus: (s) => s < 400,
+        });
+
+        const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+        const found = response.data.match(emailRegex) || [];
+
+        for (const email of found) {
+          // Skip image/asset false positives
+          if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
+          // Skip dummy/example/template addresses
+          if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
+          // Skip dummy domains
+          if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.|googleapis\.|w3\.org)/i)) continue;
+          // Skip framework artifacts
+          if (email.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)) continue;
+          // Skip very short local parts
+          if (email.split('@')[0].length < 3) continue;
+          // Skip noreply addresses
+          if (email.match(/^(noreply|no-reply|donotreply|mailer-daemon|postmaster|webmaster)@/i)) continue;
+
+          allEmails.add(email.toLowerCase());
+        }
+      } catch (err) {
+        continue;
+      }
+      await delay(1000);
+    }
+
+    if (allEmails.size === 0) return null;
+
+    // For SMEs: prioritize business-appropriate emails
+    // Priority 1: info@, contact@, office@, hello@ (best for business outreach)
+    const businessEmails = [...allEmails].filter(e =>
+      e.match(/^(info|contact|office|hello|enquiries|inquiries|reception|general)@/i)
+    );
+    if (businessEmails.length > 0) return businessEmails[0];
+
+    // Priority 2: Any email at the domain we're scraping (not support/hr/careers)
+    const domainEmails = [...allEmails].filter(e => {
+      const emailDomain = e.split('@')[1];
+      return emailDomain === domain && !e.match(/^(support|hr|careers|jobs|noreply|no-reply|privacy|abuse|spam|billing|unsubscribe|marketing|sales)@/i);
+    });
+    if (domainEmails.length > 0) return domainEmails[0];
+
+    // Priority 3: Any non-excluded email at the same domain
+    const sameDomain = [...allEmails].filter(e => e.split('@')[1] === domain);
+    if (sameDomain.length > 0) return sameDomain[0];
+
+    return null;
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ('sme_email_enrichment', 'running') RETURNING id`);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, processed, enriched) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, completed_at=NOW() WHERE id=$1`, [jobId, processed, enriched]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
 // Initialize scraper instances
 const cpaScraperOrchestrator = new CPAScraperOrchestrator();
 const corporationsCanadaAPI = new CorporationsCanadaAPI();
 const statCanODBusLoader = new StatCanODBusLoader();
 const firmWebsiteEnricher = new FirmWebsiteEnricher();
+const smeEmailEnricher = new SMEEmailEnricher();
 
 // 🔄 DATA COLLECTION ORCHESTRATOR
 class DataCollectionOrchestrator {
@@ -4170,13 +4383,23 @@ cron.schedule('0 4 1 1,4,7,10 *', async () => {
     }
 });
 
-// 📧 EMAIL ENRICHMENT — Daily at 4 AM
+// 📧 CPA EMAIL ENRICHMENT — Daily at 4 AM
 cron.schedule('0 4 * * *', async () => {
-    console.log('⏰ Starting daily email enrichment...');
+    console.log('⏰ Starting daily CPA email enrichment...');
     try {
         await firmWebsiteEnricher.enrich(dbClient);
     } catch (error) {
-        console.error('❌ Daily enrichment failed:', error.message);
+        console.error('❌ Daily CPA enrichment failed:', error.message);
+    }
+});
+
+// 📧 SME EMAIL ENRICHMENT — Daily at 5 AM
+cron.schedule('0 5 * * *', async () => {
+    console.log('⏰ Starting daily SME email enrichment...');
+    try {
+        await smeEmailEnricher.enrich(dbClient);
+    } catch (error) {
+        console.error('❌ Daily SME enrichment failed:', error.message);
     }
 });
 
@@ -4231,7 +4454,7 @@ app.post('/api/scrape/rescrape/:source', async (req, res) => {
 // POST /api/scrape/trigger/:source — manually trigger a scrape (admin only)
 app.post('/api/scrape/trigger/:source', async (req, res) => {
     const { source } = req.params;
-    const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl', 'corporations_canada', 'statcan_odbus', 'email_enrichment', 'all_cpas'];
+    const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl', 'corporations_canada', 'statcan_odbus', 'email_enrichment', 'sme_email_enrichment', 'all_cpas'];
 
     if (!validSources.includes(source)) {
         return res.status(400).json({ error: `Invalid source. Valid: ${validSources.join(', ')}` });
@@ -4249,6 +4472,8 @@ app.post('/api/scrape/trigger/:source', async (req, res) => {
             await statCanODBusLoader.load(dbClient);
         } else if (source === 'email_enrichment') {
             await firmWebsiteEnricher.enrich(dbClient);
+        } else if (source === 'sme_email_enrichment') {
+            await smeEmailEnricher.enrich(dbClient);
         } else {
             await cpaScraperOrchestrator.runSingle(source, dbClient);
         }
