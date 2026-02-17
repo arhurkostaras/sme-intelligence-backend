@@ -2173,8 +2173,8 @@ class StatCanODBusLoader {
 
 class FirmWebsiteEnricher {
   constructor() {
-    this.dailyLimit = 200;
-    this.delayMs = 5000;
+    this.dailyLimit = 500;
+    this.delayMs = 3000;
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   }
 
@@ -4390,6 +4390,16 @@ cron.schedule('0 4 * * *', async () => {
         await firmWebsiteEnricher.enrich(dbClient);
     } catch (error) {
         console.error('❌ Daily CPA enrichment failed:', error.message);
+    }
+});
+
+// 📧 CPA EMAIL ENRICHMENT — Second run at 12 PM
+cron.schedule('0 12 * * *', async () => {
+    console.log('⏰ Starting midday CPA email enrichment...');
+    try {
+        await firmWebsiteEnricher.enrich(dbClient);
+    } catch (error) {
+        console.error('❌ Midday CPA enrichment failed:', error.message);
     }
 });
 
