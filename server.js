@@ -4711,6 +4711,28 @@ app.get('/api/debug/check-data', async (req, res) => {
     }
 });
 
+
+// Admin stats endpoint for database queries
+app.get('/api/admin/db-stats', async (req, res) => {
+    try {
+        const stats = await dbClient.query('SELECT source, COUNT(*) as count FROM scraped_professionals GROUP BY source ORDER BY count DESC');
+        const enrich = await dbClient.query("SELECT COUNT(*) as total, COUNT(CASE WHEN email IS NOT NULL AND email != '' THEN 1 END) as with_email FROM scraped_professionals");
+        const campaigns = await dbClient.query('SELECT id, name, status, created_at FROM outreach_campaigns ORDER BY id DESC LIMIT 5');
+        const emailsSent = await dbClient.query("SELECT COUNT(*) as sent FROM outreach_emails WHERE status='sent'");
+        
+        res.json({
+            status: 'success',
+            scrape_totals: stats.rows,
+            enrichment: enrich.rows[0],
+            campaigns: campaigns.rows,
+            emails_sent: emailsSent.rows[0],
+            timestamp: new Date().toISOString()
+        });
+    } catch (e) {
+        res.status(500).json({ status: 'error', error: e.message });
+    }
+});
+
 // 🚀 START SERVER
 async function startServer() {
     // Initialize database (non-fatal if it fails)
