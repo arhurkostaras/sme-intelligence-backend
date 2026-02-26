@@ -2172,7 +2172,7 @@ class StatCanODBusLoader {
 // =====================================================
 
 // Expanded generic email prefixes
-const CPA_GENERIC_LOCALS = /^(info|contact|contact_us|client\.?relations|investor\.?relations|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy|billing|unsubscribe|abuse|spam|reception|general|enquiries|inquiries|accessibility|fraud|clientcare|mediarelations|wmcmediarelations|communications|media|press|compliance|legal|remittance|service|donations?|donate|team|itsecurity|solutions|feedback|mail|signs|accounting|corporatemarketing|webenquiry|centrecontact|crm|community|newsletter|events?|customerservice)@/i;
+const CPA_GENERIC_LOCALS = /^(info|contact|contact_us|client\.?relations|investor\.?relations|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy|billing|unsubscribe|abuse|spam|reception|general|enquiries|inquiries|accessibility|fraud|clientcare|mediarelations|wmcmediarelations|communications|media|press|compliance|legal|remittance|service|donations?|donate|team|itsecurity|solutions|feedback|mail|signs|accounting|corporatemarketing|webenquiry|centrecontact|crm|community|newsletter|events?|customerservice|frontdesk|connect|kontakt|foi\.?privacy)@/i;
 
 class FirmWebsiteEnricher {
   constructor() {
