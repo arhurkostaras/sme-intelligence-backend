@@ -2171,6 +2171,9 @@ class StatCanODBusLoader {
 // 📧 EMAIL ENRICHMENT PIPELINE
 // =====================================================
 
+// Expanded generic email prefixes
+const CPA_GENERIC_LOCALS = /^(info|contact|contact_us|client\.?relations|investor\.?relations|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy|billing|unsubscribe|abuse|spam|reception|general|enquiries|inquiries|accessibility|fraud|clientcare|mediarelations|wmcmediarelations|communications|media|press|compliance|legal|remittance|service|donations?|donate|team|itsecurity|solutions|feedback|mail|signs|accounting|corporatemarketing|webenquiry|centrecontact|crm|community|newsletter|events?|customerservice)@/i;
+
 class FirmWebsiteEnricher {
   constructor() {
     this.dailyLimit = 500;
@@ -2219,11 +2222,22 @@ class FirmWebsiteEnricher {
         try {
           const result = await this._findEmailForCPA(cpa, dbClient);
           if (result) {
-            await dbClient.query(
-              `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
-              [cpa.id, result.email, result.source]
+            // Dedup: skip if this email is already assigned to 2+ other professionals
+            const dupeCheck = await dbClient.query(
+              `SELECT COUNT(*) as c FROM scraped_cpas WHERE enriched_email = $1`, [result.email]
             );
-            totalEnriched++;
+            if (parseInt(dupeCheck.rows[0].c) >= 2) {
+              console.log(`[Enrichment] Skipping duplicate email ${result.email} (already assigned to ${dupeCheck.rows[0].c} records)`);
+              await dbClient.query(
+                `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`, [cpa.id]
+              );
+            } else {
+              await dbClient.query(
+                `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+                [cpa.id, result.email, result.source]
+              );
+              totalEnriched++;
+            }
           } else {
             // Mark as attempted so we don't keep retrying
             await dbClient.query(
@@ -2261,11 +2275,22 @@ class FirmWebsiteEnricher {
           try {
             const result = await this._findEmailNoFirm(cpa);
             if (result) {
-              await dbClient.query(
-                `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, firm_name = COALESCE(NULLIF(firm_name, ''), $4), enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
-                [cpa.id, result.email, result.source, result.firmName || '']
+              // Dedup: skip if this email is already assigned to 2+ other professionals
+              const dupeCheck = await dbClient.query(
+                `SELECT COUNT(*) as c FROM scraped_cpas WHERE enriched_email = $1`, [result.email]
               );
-              totalEnriched++;
+              if (parseInt(dupeCheck.rows[0].c) >= 2) {
+                console.log(`[Enrichment] Skipping duplicate email ${result.email} (already assigned to ${dupeCheck.rows[0].c} records)`);
+                await dbClient.query(
+                  `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`, [cpa.id]
+                );
+              } else {
+                await dbClient.query(
+                  `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, firm_name = COALESCE(NULLIF(firm_name, ''), $4), enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+                  [cpa.id, result.email, result.source, result.firmName || '']
+                );
+                totalEnriched++;
+              }
             } else {
               await dbClient.query(
                 `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
@@ -2388,7 +2413,8 @@ class FirmWebsiteEnricher {
 
             for (const email of foundEmails) {
               if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
-              if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail|info|admin|support|contact|reception|office|careers|hr|hello|general|webmaster|noreply|no-reply)@/i)) continue;
+              if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
+              if (CPA_GENERIC_LOCALS.test(email)) continue;
               if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.)/i)) continue;
               if (email.split('@')[0].length < 3) continue;
 
@@ -2450,11 +2476,14 @@ class FirmWebsiteEnricher {
 
         for (const email of found) {
           // Skip image/asset false positives
-          if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
+          if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js|webp|ico|woff|woff2|ttf|eot|map)$/i)) continue;
+          if (email.match(/\d+x\d*\./)) continue;
           // Skip dummy/example/template addresses
           if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
-          // Skip dummy domains
-          if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.)/i)) continue;
+          // Skip generic corporate prefixes
+          if (CPA_GENERIC_LOCALS.test(email)) continue;
+          // Skip dummy/template domains
+          if (email.match(/@(mysite|yoursite|yourdomain|domain|website|site|example|sentry|wixpress|mailchimp|placeholder|test)\./i)) continue;
           // Skip known template/framework artifact emails
           if (email.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)) continue;
           // Skip very short local parts (likely false positives like "a@b.com")
@@ -2479,16 +2508,10 @@ class FirmWebsiteEnricher {
     // Priority: name-matched email > non-generic email > generic email
     if (nameMatchEmails.length > 0) return nameMatchEmails[0];
 
-    const nonGeneric = [...allEmails].filter(e =>
-      !e.match(/^(info|contact|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy)@/i)
-    );
+    const nonGeneric = [...allEmails].filter(e => !CPA_GENERIC_LOCALS.test(e));
     if (nonGeneric.length > 0) return nonGeneric[0];
 
-    const generic = [...allEmails].filter(e =>
-      e.match(/^(info|contact|office)@/i)
-    );
-    if (generic.length > 0) return generic[0];
-
+    // Don't return generic emails at all — they waste outreach cycles
     return null;
   }
 
