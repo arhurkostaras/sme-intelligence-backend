@@ -4614,6 +4614,43 @@ app.get('/api/scraped-cpas/stats', async (req, res) => {
     }
 });
 
+// GET /api/scraped-cpas/match — return quality CPAs for client matching
+app.get('/api/scraped-cpas/match', async (req, res) => {
+    try {
+        const { province, city, specialization, limit = 50 } = req.query;
+        const params = [];
+        const conditions = [
+            "full_name IS NOT NULL",
+            "full_name != ''"
+        ];
+        let paramIdx = 1;
+
+        if (province) { conditions.push(`province ILIKE $${paramIdx++}`); params.push(`%${province}%`); }
+        if (city) { conditions.push(`city ILIKE $${paramIdx++}`); params.push(`%${city}%`); }
+        if (specialization) { conditions.push(`designation ILIKE $${paramIdx++}`); params.push(`%${specialization}%`); }
+
+        const where = `WHERE ${conditions.join(' AND ')}`;
+        const lim = Math.min(100, parseInt(limit) || 50);
+        params.push(lim);
+
+        const result = await dbClient.query(
+            `SELECT id, first_name, last_name, full_name, designation, province, city,
+                    firm_name, COALESCE(enriched_email, email) as email, source
+             FROM scraped_cpas ${where}
+             ORDER BY
+               CASE WHEN firm_name IS NOT NULL AND firm_name != '' THEN 0 ELSE 1 END,
+               CASE WHEN COALESCE(enriched_email, email) IS NOT NULL THEN 0 ELSE 1 END,
+               RANDOM()
+             LIMIT $${paramIdx}`,
+            params
+        );
+
+        res.json({ status: 'success', cpas: result.rows, total: result.rows.length });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
 // GET /api/scraped-smes — browse scraped SMEs
 app.get('/api/scraped-smes', async (req, res) => {
     try {
