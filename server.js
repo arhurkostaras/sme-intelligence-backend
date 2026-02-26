@@ -4678,15 +4678,32 @@ app.get('/api/scraped-smes/stats', async (req, res) => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'OK',
-        message: 'SME Intelligence Backend is running',
-        timestamp: new Date().toISOString(),
-        services: {
-            database: dbClient._connected ? 'connected' : 'disconnected',
-            redis: redisClient.isOpen ? 'connected' : 'disconnected'
+app.get('/health', async (req, res) => {
+    const start = Date.now();
+    let dbStatus = 'disconnected';
+    let redisStatus = 'disconnected';
+    try {
+        await dbClient.query('SELECT 1');
+        dbStatus = 'connected';
+    } catch (e) {
+        dbStatus = 'error: ' + e.message;
+    }
+    try {
+        if (redisClient.isOpen) {
+            await redisClient.ping();
+            redisStatus = 'connected';
         }
+    } catch (e) {
+        redisStatus = 'error: ' + e.message;
+    }
+    const ok = dbStatus === 'connected';
+    res.status(ok ? 200 : 503).json({
+        status: ok ? 'OK' : 'DEGRADED',
+        message: 'SME Intelligence Backend',
+        timestamp: new Date().toISOString(),
+        uptime_seconds: Math.floor(process.uptime()),
+        response_ms: Date.now() - start,
+        services: { database: dbStatus, redis: redisStatus }
     });
 });
 
