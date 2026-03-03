@@ -10,7 +10,6 @@
     "deploy": "railway deploy"
   },
   "dependencies": {
-    "@sentry/node": "^10.38.0",
     "adm-zip": "^0.5.16",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0-rc.12",

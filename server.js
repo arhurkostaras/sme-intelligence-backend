@@ -1,6 +1,5 @@
 // server.js - Real-Time SME Intelligence Backend
 // Complete Node.js server for Canadian SME intelligence data collection
-const Sentry = require('@sentry/node');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -8,17 +7,11 @@ const cheerio = require('cheerio');
 const { Client } = require('pg');
 const Redis = require('redis');
 const cron = require('node-cron');
+const dns = require('dns').promises;
+const net = require('net');
+const crypto = require('crypto');
 const Stripe = require('stripe');
-const { sendSubscriptionConfirmation, sendPaymentReceipt, sendPaymentFailedAlert } = require('./services/email');
-
-// Initialize Sentry before anything else
-if (process.env.SENTRY_DSN) {
-  Sentry.init({
-    dsn: process.env.SENTRY_DSN,
-    environment: process.env.NODE_ENV || 'production',
-    tracesSampleRate: 0.2,
-  });
-}
+const { sendEmail, sendSubscriptionConfirmation, sendPaymentReceipt, sendPaymentFailedAlert } = require('./services/email');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -40,13 +33,6 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://canadaaccountants.app'
 
 // --- Stripe webhook route MUST be before express.json() ---
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
-
-// Sentry request handler (must be before other middleware, but after Stripe raw webhook)
-if (process.env.SENTRY_DSN && Sentry.Handlers) {
-  app.use(Sentry.Handlers.requestHandler());
-} else if (process.env.SENTRY_DSN && Sentry.setupExpressErrorHandler) {
-  // Sentry SDK v8+ uses setupExpressErrorHandler instead of Handlers
-}
 
 // Middleware
 app.use(cors({
@@ -255,6 +241,121 @@ async function createTables() {
     `;
 
     await dbClient.query(createTablesQuery);
+
+    // Ensure scraped_smes, scraped_cpas, scrape_jobs tables exist
+    await dbClient.query(`
+        CREATE TABLE IF NOT EXISTS scrape_jobs (
+            id SERIAL PRIMARY KEY,
+            source VARCHAR(100) NOT NULL,
+            status VARCHAR(50) NOT NULL DEFAULT 'running',
+            records_found INTEGER DEFAULT 0,
+            records_inserted INTEGER DEFAULT 0,
+            records_skipped INTEGER DEFAULT 0,
+            error_message TEXT,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_scrape_jobs_source ON scrape_jobs(source);
+        CREATE INDEX IF NOT EXISTS idx_scrape_jobs_status ON scrape_jobs(status);
+
+        CREATE TABLE IF NOT EXISTS scraped_cpas (
+            id SERIAL PRIMARY KEY,
+            source VARCHAR(100) NOT NULL,
+            first_name VARCHAR(255),
+            last_name VARCHAR(255),
+            full_name VARCHAR(500),
+            designation VARCHAR(100),
+            province VARCHAR(50),
+            city VARCHAR(255),
+            firm_name VARCHAR(500),
+            firm_website VARCHAR(500),
+            phone VARCHAR(50),
+            email VARCHAR(255),
+            enriched_email VARCHAR(255),
+            enrichment_source VARCHAR(255),
+            enrichment_date TIMESTAMP,
+            name_hash VARCHAR(64),
+            status VARCHAR(50) DEFAULT 'raw',
+            scrape_job_id INTEGER,
+            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_scraped_cpas_source ON scraped_cpas(source);
+        CREATE INDEX IF NOT EXISTS idx_scraped_cpas_province ON scraped_cpas(province);
+        CREATE INDEX IF NOT EXISTS idx_scraped_cpas_status ON scraped_cpas(status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_scraped_cpas_name_hash ON scraped_cpas(name_hash) WHERE name_hash IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS scraped_smes (
+            id SERIAL PRIMARY KEY,
+            source VARCHAR(100) NOT NULL,
+            business_name VARCHAR(500),
+            corporate_number VARCHAR(100),
+            naics_code VARCHAR(20),
+            industry VARCHAR(255),
+            province VARCHAR(50),
+            city VARCHAR(255),
+            business_status VARCHAR(100),
+            contact_email VARCHAR(255),
+            website VARCHAR(500),
+            enrichment_source VARCHAR(255),
+            enrichment_date TIMESTAMP,
+            status VARCHAR(50) DEFAULT 'raw',
+            scrape_job_id INTEGER,
+            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_scraped_smes_source ON scraped_smes(source);
+        CREATE INDEX IF NOT EXISTS idx_scraped_smes_province ON scraped_smes(province);
+        CREATE INDEX IF NOT EXISTS idx_scraped_smes_status ON scraped_smes(status);
+        CREATE INDEX IF NOT EXISTS idx_scraped_smes_corporate_number ON scraped_smes(corporate_number);
+    `);
+
+    // Phase 1a: Extend scraped_smes with prospect scoring & enrichment columns
+    await dbClient.query(`
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS phone VARCHAR(30);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS full_address TEXT;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS postal_code VARCHAR(10);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS latitude DECIMAL(10,7);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS longitude DECIMAL(10,7);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS employee_count VARCHAR(50);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS incorporation_date DATE;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS directors JSONB;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS business_type VARCHAR(100);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS years_in_business INTEGER;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS data_sources JSONB DEFAULT '[]';
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS score_accountants INTEGER;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS score_lawyers INTEGER;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS score_investing INTEGER;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS queue_status_accountants VARCHAR(30) DEFAULT 'unscored';
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS queue_status_lawyers VARCHAR(30) DEFAULT 'unscored';
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS queue_status_investing VARCHAR(30) DEFAULT 'unscored';
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS name_province_hash VARCHAR(64);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS contact_phone VARCHAR(30);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS contact_name VARCHAR(200);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS enrichment_attempts INTEGER DEFAULT 0;
+
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS website_source VARCHAR(100);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS email_verification_method VARCHAR(50);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS enrichment_phase VARCHAR(50) DEFAULT 'pending';
+
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS grant_amount DECIMAL(14,2);
+        ALTER TABLE scraped_smes ADD COLUMN IF NOT EXISTS grant_program VARCHAR(200);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_smes_name_province_hash
+            ON scraped_smes(name_province_hash) WHERE name_province_hash IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_smes_score_acct ON scraped_smes(score_accountants DESC NULLS LAST);
+        CREATE INDEX IF NOT EXISTS idx_smes_score_law ON scraped_smes(score_lawyers DESC NULLS LAST);
+        CREATE INDEX IF NOT EXISTS idx_smes_score_inv ON scraped_smes(score_investing DESC NULLS LAST);
+        CREATE INDEX IF NOT EXISTS idx_smes_naics ON scraped_smes(naics_code);
+        CREATE INDEX IF NOT EXISTS idx_smes_no_website ON scraped_smes(id)
+            WHERE website IS NULL AND business_name IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_smes_has_website_no_email ON scraped_smes(id)
+            WHERE contact_email IS NULL AND website IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_smes_enrichment_phase ON scraped_smes(enrichment_phase);
+        CREATE INDEX IF NOT EXISTS idx_scraped_smes_industry ON scraped_smes(industry);
+    `);
+    console.log('✅ scraped_smes prospect columns & indexes ensured');
 }
 
 // 🇨🇦 STATISTICS CANADA API INTEGRATION
@@ -478,8 +579,6 @@ const COMMON_CANADIAN_LAST_NAMES = [
   'Lavoie', 'Fortin', 'Gagné', 'Ouellet', 'Pelletier', 'Bélanger',
   'Lévesque', 'Bergeron', 'Leblanc', 'Côté', 'Girard', 'Poirier'
 ];
-
-const crypto = require('crypto');
 
 // Helper: Generate name hash for deduplication
 function generateNameHash(name, province) {
@@ -1840,145 +1939,267 @@ class CPAScraperOrchestrator {
 // 🏢 SME DATA COLLECTION
 // =====================================================
 
-// 3A. Corporations Canada — Legacy HTML form scraper + JSON detail API
-// No public REST search API exists. We POST to the legacy search form,
-// parse result links to extract corpIds, then fetch JSON details.
-class CorporationsCanadaAPI {
+// Helper: generate dedup hash from business name + province
+function nameProvinceHash(businessName, province) {
+  if (!businessName) return null;
+  const normalized = (businessName.toLowerCase().trim() + '|' + (province || '').toLowerCase().trim());
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+// 3A. Corporations Canada — Bulk Open Data Download
+// Downloads ALL ~500K active federal corporations (replaces old 20-per-keyword scraper)
+class CorporationsCanadaBulkLoader {
   constructor() {
-    this.searchUrl = 'https://ised-isde.canada.ca/cc/lgcy/fdrlCrpSrch.html?locale=en_CA';
-    this.detailUrl = 'https://ised-isde.canada.ca/cc/lgcy/api/corporations';
+    this.bulkUrl = 'https://ised-isde.canada.ca/cc/lgcy/download/OPEN_DATA_SPLIT.zip';
     this.source = 'corporations_canada';
-    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.userAgent = 'CanadaAccountants-DataCollection/1.0';
   }
 
-  async scrape(dbClient) {
-    console.log('🔍 Starting Corporations Canada scrape...');
+  async load(dbClient) {
+    console.log('🔍 Starting Corporations Canada bulk download...');
     const jobId = await this._startJob(dbClient);
-    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0, totalMerged = 0;
 
     try {
-      // Search requires minimum 3 characters, returns max 20 per page
-      // Use focused search terms: common Canadian business prefixes and province-related terms
-      const searchTerms = [
-        // Common business structure words
-        'Inc', 'Ltd', 'Corp', 'Group', 'Holdings', 'Capital', 'Ventures', 'Services',
-        'Solutions', 'Management', 'Consulting', 'Global', 'National', 'International',
-        'Industries', 'Enterprises', 'Development', 'Properties', 'Investment', 'Financial',
-        'Technology', 'Digital', 'Media', 'Energy', 'Resources', 'Mining', 'Construction',
-        // Canada-specific
-        'Canada', 'Canadian', 'Dominion', 'Federal', 'Pacific', 'Atlantic', 'Northern',
-        'Western', 'Eastern', 'Trans', 'Rocky', 'Maple', 'Arctic', 'Prairie',
-        // Province names
-        'Ontario', 'Quebec', 'Alberta', 'British', 'Manitoba', 'Saskatchewan', 'Nova',
-        'Brunswick', 'Newfoundland', 'Prince', 'Yukon', 'Northwest',
-        // City names (major)
-        'Toronto', 'Montreal', 'Vancouver', 'Calgary', 'Edmonton', 'Ottawa', 'Winnipeg',
-        'Hamilton', 'Halifax', 'Victoria', 'Saskatoon', 'Regina', 'Mississauga',
-        // Industry terms
-        'Health', 'Pharma', 'Bio', 'Medical', 'Food', 'Restaurant', 'Hotel', 'Travel',
-        'Auto', 'Transport', 'Logistics', 'Insurance', 'Real', 'Estate', 'Legal',
-        'Engineering', 'Architecture', 'Design', 'Marketing', 'Software', 'Cloud',
-        'Data', 'Security', 'Clean', 'Green', 'Solar', 'Wind', 'Oil', 'Gas', 'Petro',
-        'Agri', 'Farm', 'Forest', 'Fish', 'Ocean', 'Marine',
-        // Common 3-letter combos that match many businesses
-        'AAA', 'ABC', 'ACE', 'ALL', 'BAY', 'BIG', 'CAN', 'CAP', 'COM', 'CON',
-        'DYN', 'ECO', 'EXP', 'FIN', 'GEN', 'GOL', 'HIG', 'HUB', 'IMM', 'INN',
-        'KEY', 'LAK', 'LIN', 'MAX', 'MER', 'MID', 'NET', 'NEW', 'NOR', 'ONE',
-        'OPT', 'PAC', 'PEA', 'PIN', 'POW', 'PRE', 'PRO', 'QUA', 'RED', 'ROY',
-        'SKY', 'SOL', 'STA', 'SUN', 'TEC', 'TOP', 'TRI', 'UNI', 'VAN', 'WES',
-      ];
-      console.log(`[CorpsCan] Will search ${searchTerms.length} terms`);
+      console.log('[CorpsCan] Downloading bulk ZIP...');
+      const response = await axios.get(this.bulkUrl, {
+        responseType: 'arraybuffer',
+        timeout: 600000,
+        headers: { 'User-Agent': this.userAgent },
+      });
+      console.log(`[CorpsCan] Downloaded ${(response.data.byteLength / 1048576).toFixed(1)}MB`);
 
-      for (let si = 0; si < searchTerms.length; si++) {
-        const prefix = searchTerms[si];
-        if (si % 20 === 0) {
-          console.log(`[CorpsCan] Progress: ${si}/${searchTerms.length} terms... Found: ${totalFound}, Inserted: ${totalInserted}`);
+      const zip = new AdmZip(Buffer.from(response.data));
+      const entries = zip.getEntries();
+      console.log(`[CorpsCan] ZIP entries: ${entries.map(e => `${e.entryName} (${(e.header.size / 1024).toFixed(0)}KB)`).join(', ')}`);
+
+      const dataEntries = entries.filter(e =>
+        (e.entryName.endsWith('.csv') || e.entryName.endsWith('.xml')) && !e.entryName.startsWith('__MACOSX')
+      );
+
+      if (dataEntries.length === 0) {
+        throw new Error('No data files in ZIP. Entries: ' + entries.map(e => e.entryName).join(', '));
+      }
+
+      for (const entry of dataEntries) {
+        console.log(`[CorpsCan] Processing: ${entry.entryName} (${(entry.header.size / 1048576).toFixed(1)}MB)`);
+        const content = entry.getData().toString('utf8');
+
+        if (entry.entryName.endsWith('.csv')) {
+          const result = await this._processCSV(dbClient, content, jobId);
+          totalFound += result.found; totalInserted += result.inserted;
+          totalSkipped += result.skipped; totalMerged += result.merged;
+        } else if (entry.entryName.endsWith('.xml')) {
+          const result = await this._processXML(dbClient, content, jobId);
+          totalFound += result.found; totalInserted += result.inserted;
+          totalSkipped += result.skipped; totalMerged += result.merged;
         }
-
-        try {
-          // POST to legacy search form
-          const formData = new URLSearchParams();
-          formData.append('corpName', prefix);
-          formData.append('corpNumber', '');
-          formData.append('busNumber', '');
-          formData.append('corpProvince', '');
-          formData.append('corpStatus', '1'); // 1=Active, 9=Amalgamated, 10=Discontinued, 11=Dissolved, ''=Any
-          formData.append('corpAct', '');
-          formData.append('buttonNext', 'Search');
-          formData.append('_pageFlowMap', '');
-          formData.append('_page', '');
-
-          const searchRes = await axios.post(this.searchUrl, formData.toString(), {
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'User-Agent': this.userAgent,
-              'Referer': this.searchUrl,
-            },
-            timeout: 30000,
-            maxRedirects: 5,
-          });
-
-          // Parse HTML to extract corporation IDs from result links
-          const $ = cheerio.load(searchRes.data);
-          const corpIds = [];
-          $('a[href*="fdrlCrpDtls.html"]').each((_, el) => {
-            const href = $(el).attr('href') || '';
-            const match = href.match(/corpId=(\d+)/);
-            if (match) corpIds.push(match[1]);
-          });
-
-          totalFound += corpIds.length;
-
-          // Fetch JSON details for each corporation
-          for (const corpId of corpIds) {
-            try {
-              const detailRes = await axios.get(`${this.detailUrl}/${corpId}.json?lang=eng`, {
-                headers: { 'User-Agent': this.userAgent },
-                timeout: 10000,
-              });
-
-              const data = Array.isArray(detailRes.data) ? detailRes.data[0] : detailRes.data;
-              if (!data) continue;
-
-              const corpName = data.corporationNames?.[0]?.CorporationName?.name || '';
-              const corpNumber = data.corporationId || corpId;
-              const province = data.adresses?.[0]?.address?.provinceCode || '';
-              const status = data.status || 'Active';
-              const city = data.adresses?.[0]?.address?.city || '';
-
-              // Check for duplicate
-              const existing = await dbClient.query(
-                'SELECT id FROM scraped_smes WHERE corporate_number = $1',
-                [corpNumber.toString()]
-              );
-              if (existing.rows.length > 0) { totalSkipped++; continue; }
-
-              await dbClient.query(
-                `INSERT INTO scraped_smes (source, business_name, corporate_number, province, city, business_status, scrape_job_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                [this.source, corpName, corpNumber.toString(), province, city, status, jobId]
-              );
-              totalInserted++;
-            } catch (detailErr) {
-              // Skip individual detail errors
-            }
-            await delay(500); // 0.5s between detail requests
-          }
-        } catch (err) {
-          console.error(`[CorpsCan] Error for prefix "${prefix}":`, err.message);
-        }
-
-        await delay(3000);
       }
 
       await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
-      console.log(`✅ Corporations Canada scrape complete: ${totalFound} found, ${totalInserted} inserted`);
+      console.log(`✅ CorpsCan bulk load: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged, ${totalSkipped} skipped`);
+
+      // Post-processing: flag newly incorporated businesses as high-priority
+      try {
+        const flagged = await dbClient.query(`
+          UPDATE scraped_smes SET
+            score_accountants = GREATEST(COALESCE(score_accountants, 0), 90),
+            score_lawyers = GREATEST(COALESCE(score_lawyers, 0), 85),
+            score_investing = GREATEST(COALESCE(score_investing, 0), 70),
+            queue_status_accountants = CASE WHEN queue_status_accountants != 'queued' THEN 'ready' ELSE queue_status_accountants END,
+            queue_status_lawyers = CASE WHEN queue_status_lawyers != 'queued' THEN 'ready' ELSE queue_status_lawyers END,
+            queue_status_investing = CASE WHEN queue_status_investing != 'queued' THEN 'ready' ELSE queue_status_investing END
+          WHERE source = 'corporations_canada'
+            AND incorporation_date > NOW() - INTERVAL '30 days'
+            AND queue_status_accountants != 'queued'
+        `);
+        console.log(`🏢 New corp flagging: ${flagged.rowCount} recently incorporated businesses flagged as high-priority`);
+      } catch (flagErr) {
+        console.error('[CorpsCan] New corp flagging failed (non-fatal):', flagErr.message);
+      }
     } catch (error) {
       await this._failJob(dbClient, jobId, error.message);
-      console.error('❌ Corporations Canada scrape failed:', error.message);
+      console.error('❌ CorpsCan bulk load failed:', error.message);
     }
+    return { found: totalFound, inserted: totalInserted, merged: totalMerged, skipped: totalSkipped };
+  }
 
-    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  // Keep backward compat: old crons call .scrape()
+  async scrape(dbClient) { return this.load(dbClient); }
+
+  async _processCSV(dbClient, csvContent, jobId) {
+    let found = 0, inserted = 0, skipped = 0, merged = 0;
+    const lines = csvContent.split('\n');
+    if (lines.length < 2) return { found, inserted, skipped, merged };
+
+    const rawHeaders = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+    const colIdx = {};
+    rawHeaders.forEach((h, i) => { colIdx[h] = i; });
+
+    const nameCol = colIdx['corporation_name'] ?? colIdx['corp_name'] ?? colIdx['name'] ?? colIdx['business_name'] ?? 0;
+    const numCol = colIdx['corporation_number'] ?? colIdx['corp_number'] ?? colIdx['number'] ?? colIdx['corporate_number'] ?? 1;
+    const statusCol = colIdx['status'] ?? colIdx['corp_status'] ?? colIdx['corporation_status'];
+    const dateCol = colIdx['incorporation_date'] ?? colIdx['date_of_incorporation'] ?? colIdx['date_incorporation'];
+    const provCol = colIdx['province'] ?? colIdx['jurisdiction'] ?? colIdx['prov'];
+    const cityCol = colIdx['city'];
+    const addressCol = colIdx['registered_office_address'] ?? colIdx['address'] ?? colIdx['full_address'];
+    const postalCol = colIdx['postal_code'];
+    const typeCol = colIdx['corporation_type'] ?? colIdx['corp_type'] ?? colIdx['type'] ?? colIdx['business_type'];
+
+    const batch = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      found++;
+
+      const cols = this._parseCSVLine(line);
+      const corpName = (cols[nameCol] || '').trim();
+      const corpNumber = (cols[numCol] || '').trim();
+      if (!corpName || corpName.length < 2) continue;
+
+      batch.push({
+        corpName, corpNumber,
+        province: provCol !== undefined ? (cols[provCol] || '').trim() : '',
+        city: cityCol !== undefined ? (cols[cityCol] || '').trim() : '',
+        status: statusCol !== undefined ? (cols[statusCol] || 'Active').trim() : 'Active',
+        incDate: dateCol !== undefined ? (cols[dateCol] || '').trim() : '',
+        address: addressCol !== undefined ? (cols[addressCol] || '').trim() : '',
+        postal: postalCol !== undefined ? (cols[postalCol] || '').trim() : '',
+        bizType: typeCol !== undefined ? (cols[typeCol] || '').trim() : '',
+      });
+
+      if (batch.length >= 500) {
+        if (found % 50000 === 0) console.log(`[CorpsCan] CSV progress: ${found} processed, ${inserted} new, ${merged} merged`);
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        inserted += r.inserted; skipped += r.skipped; merged += r.merged;
+        batch.length = 0;
+      }
+    }
+    if (batch.length > 0) {
+      const r = await this._insertBatch(dbClient, batch, jobId);
+      inserted += r.inserted; skipped += r.skipped; merged += r.merged;
+    }
+    return { found, inserted, skipped, merged };
+  }
+
+  async _processXML(dbClient, xmlContent, jobId) {
+    let found = 0, inserted = 0, skipped = 0, merged = 0;
+    const corpRegex = /<corporation\b[^>]*>([\s\S]*?)<\/corporation>/gi;
+    const batch = [];
+    let match;
+
+    while ((match = corpRegex.exec(xmlContent)) !== null) {
+      found++;
+      const block = match[1];
+      const extract = (tag) => {
+        const m = block.match(new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, 'i'));
+        return m ? m[1].trim() : '';
+      };
+
+      const corpName = extract('corporationName') || extract('name') || extract('corp_name');
+      if (!corpName || corpName.length < 2) continue;
+
+      batch.push({
+        corpName,
+        corpNumber: extract('corporationNumber') || extract('businessNumber') || '',
+        province: extract('province') || extract('jurisdiction') || '',
+        city: extract('city') || '',
+        status: extract('status') || 'Active',
+        incDate: extract('incorporationDate') || extract('dateOfIncorporation') || '',
+        address: extract('registeredOfficeAddress') || extract('address') || '',
+        postal: extract('postalCode') || '',
+        bizType: extract('corporationType') || extract('type') || '',
+      });
+
+      if (batch.length >= 500) {
+        if (found % 50000 === 0) console.log(`[CorpsCan] XML progress: ${found} processed, ${inserted} new, ${merged} merged`);
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        inserted += r.inserted; skipped += r.skipped; merged += r.merged;
+        batch.length = 0;
+      }
+    }
+    if (batch.length > 0) {
+      const r = await this._insertBatch(dbClient, batch, jobId);
+      inserted += r.inserted; skipped += r.skipped; merged += r.merged;
+    }
+    return { found, inserted, skipped, merged };
+  }
+
+  async _insertBatch(dbClient, records, jobId) {
+    let inserted = 0, skipped = 0, merged = 0;
+    for (const rec of records) {
+      try {
+        const hash = nameProvinceHash(rec.corpName, rec.province);
+        const incDate = rec.incDate ? this._parseDate(rec.incDate) : null;
+        const yearsInBiz = incDate ? Math.floor((Date.now() - incDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000)) : null;
+
+        // Merge with existing record (from ODBus or previous load)
+        if (hash) {
+          const existing = await dbClient.query('SELECT id, data_sources FROM scraped_smes WHERE name_province_hash = $1', [hash]);
+          if (existing.rows.length > 0) {
+            const row = existing.rows[0];
+            const sources = Array.isArray(row.data_sources) ? row.data_sources : [];
+            if (!sources.includes(this.source)) sources.push(this.source);
+            await dbClient.query(
+              `UPDATE scraped_smes SET
+                corporate_number = COALESCE(corporate_number, $2),
+                incorporation_date = COALESCE(incorporation_date, $3),
+                years_in_business = COALESCE(years_in_business, $4),
+                business_type = COALESCE(business_type, $5),
+                full_address = COALESCE(full_address, $6),
+                postal_code = COALESCE(postal_code, $7),
+                business_status = COALESCE(NULLIF(business_status, ''), $8),
+                data_sources = $9, updated_at = NOW()
+              WHERE id = $1`,
+              [row.id, rec.corpNumber || null, incDate, yearsInBiz, rec.bizType || null,
+               rec.address || null, rec.postal || null, rec.status || null, JSON.stringify(sources)]
+            );
+            merged++;
+            continue;
+          }
+        }
+
+        // Check duplicate by corporate_number
+        if (rec.corpNumber) {
+          const dup = await dbClient.query('SELECT id FROM scraped_smes WHERE corporate_number = $1', [rec.corpNumber]);
+          if (dup.rows.length > 0) { skipped++; continue; }
+        }
+
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, corporate_number, province, city, business_status,
+            incorporation_date, years_in_business, business_type, full_address, postal_code,
+            name_province_hash, data_sources, scrape_job_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          [this.source, rec.corpName, rec.corpNumber || null, rec.province, rec.city,
+           rec.status || 'Active', incDate, yearsInBiz, rec.bizType || null,
+           rec.address || null, rec.postal || null, hash,
+           JSON.stringify([this.source]), jobId]
+        );
+        inserted++;
+      } catch (err) {
+        skipped++;
+      }
+    }
+    return { inserted, skipped, merged };
+  }
+
+  _parseDate(dateStr) {
+    if (!dateStr) return null;
+    try { const d = new Date(dateStr); return isNaN(d.getTime()) ? null : d; } catch { return null; }
+  }
+
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
   }
 
   async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
@@ -2096,10 +2317,14 @@ class StatCanODBusLoader {
         const city = val(colIdx['city']);
         const status = val(colIdx['status']) || 'Active';
         const employees = val(colIdx['total_no_employees']);
+        const lat = val(colIdx['latitude']);
+        const lon = val(colIdx['longitude']);
+        const fullAddress = val(colIdx['full_address']);
+        const postalCode = val(colIdx['postal_code']);
 
         if (!businessName || businessName.length < 2) continue;
 
-        batch.push({ businessName, naicsCode, naicsDescr, province, city, status, employees });
+        batch.push({ businessName, naicsCode, naicsDescr, province, city, status, employees, lat, lon, fullAddress, postalCode });
 
         if (batch.length >= 500) {
           if (totalFound % 50000 === 0) {
@@ -2145,24 +2370,587 @@ class StatCanODBusLoader {
   }
 
   async _insertBatch(dbClient, records, jobId) {
-    let inserted = 0, skipped = 0;
+    let inserted = 0, skipped = 0, merged = 0;
     for (const rec of records) {
       try {
         const industry = rec.naicsDescr || StatCanODBusLoader.naicsToIndustry(rec.naicsCode);
+        const hash = nameProvinceHash(rec.businessName, rec.province);
+        const lat = rec.lat && rec.lat !== '' ? parseFloat(rec.lat) : null;
+        const lon = rec.lon && rec.lon !== '' ? parseFloat(rec.lon) : null;
+
+        // Try merge with existing record
+        if (hash) {
+          const existing = await dbClient.query('SELECT id, data_sources FROM scraped_smes WHERE name_province_hash = $1', [hash]);
+          if (existing.rows.length > 0) {
+            const row = existing.rows[0];
+            const sources = Array.isArray(row.data_sources) ? row.data_sources : [];
+            if (!sources.includes(this.source)) sources.push(this.source);
+            await dbClient.query(
+              `UPDATE scraped_smes SET
+                naics_code = COALESCE(naics_code, $2), industry = COALESCE(industry, $3),
+                employee_count = COALESCE(employee_count, $4),
+                latitude = COALESCE(latitude, $5), longitude = COALESCE(longitude, $6),
+                full_address = COALESCE(full_address, $7), postal_code = COALESCE(postal_code, $8),
+                data_sources = $9, updated_at = NOW()
+              WHERE id = $1`,
+              [row.id, rec.naicsCode || null, industry, rec.employees || null,
+               lat, lon, rec.fullAddress || null, rec.postalCode || null, JSON.stringify(sources)]
+            );
+            merged++;
+            continue;
+          }
+        }
+
         await dbClient.query(
-          `INSERT INTO scraped_smes (source, business_name, naics_code, industry, province, city, business_status, scrape_job_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [this.source, rec.businessName, rec.naicsCode, industry, rec.province, rec.city, rec.status, jobId]
+          `INSERT INTO scraped_smes (source, business_name, naics_code, industry, province, city,
+            business_status, employee_count, latitude, longitude, full_address, postal_code,
+            name_province_hash, data_sources, scrape_job_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [this.source, rec.businessName, rec.naicsCode, industry, rec.province, rec.city,
+           rec.status, rec.employees || null, lat, lon,
+           rec.fullAddress || null, rec.postalCode || null, hash,
+           JSON.stringify([this.source]), jobId]
         );
         inserted++;
       } catch (err) {
-        skipped++; // duplicate or constraint error
+        skipped++;
       }
     }
-    return { inserted, skipped };
+    return { inserted, skipped, merged };
   }
 
   async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 🏙️ MUNICIPAL BUSINESS LICENCE SCRAPERS
+// =====================================================
+
+// 3C. Vancouver Business Licences — OpenDataSoft API
+class VancouverBizLicScraper {
+  constructor() {
+    this.source = 'vancouver_biz_lic';
+    this.baseUrl = 'https://opendata.vancouver.ca/api/records/1.0/search/';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting Vancouver business licence scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0, totalMerged = 0;
+
+    try {
+      let start = 0;
+      const rows = 100;
+      let hasMore = true;
+
+      while (hasMore) {
+        const response = await axios.get(this.baseUrl, {
+          params: {
+            dataset: 'business-licences',
+            rows,
+            start,
+            'refine.status': 'Issued',
+          },
+          timeout: 30000,
+        });
+
+        const records = response.data.records || [];
+        totalFound += records.length;
+
+        if (records.length === 0) { hasMore = false; break; }
+
+        for (const record of records) {
+          const f = record.fields || {};
+          const businessName = f.businessname || f.tradename || '';
+          if (!businessName || businessName.length < 2) continue;
+
+          const hash = nameProvinceHash(businessName, 'BC');
+          try {
+            if (hash) {
+              const existing = await dbClient.query('SELECT id, data_sources FROM scraped_smes WHERE name_province_hash = $1', [hash]);
+              if (existing.rows.length > 0) {
+                const row = existing.rows[0];
+                const sources = Array.isArray(row.data_sources) ? row.data_sources : [];
+                if (!sources.includes(this.source)) {
+                  sources.push(this.source);
+                  await dbClient.query(
+                    `UPDATE scraped_smes SET full_address = COALESCE(full_address, $2),
+                      postal_code = COALESCE(postal_code, $3), business_type = COALESCE(business_type, $4),
+                      data_sources = $5, business_status = 'Active', updated_at = NOW() WHERE id = $1`,
+                    [row.id, f.house + ' ' + f.street || null, f.postalcode || null,
+                     f.businesstype || f.businesssubtype || null, JSON.stringify(sources)]
+                  );
+                }
+                totalMerged++; continue;
+              }
+            }
+
+            await dbClient.query(
+              `INSERT INTO scraped_smes (source, business_name, province, city, business_status,
+                full_address, postal_code, business_type, name_province_hash, data_sources, scrape_job_id)
+               VALUES ($1,$2,'BC','Vancouver','Active',$3,$4,$5,$6,$7,$8)`,
+              [this.source, businessName,
+               f.house && f.street ? (f.house + ' ' + f.street) : null,
+               f.postalcode || null, f.businesstype || f.businesssubtype || null,
+               hash, JSON.stringify([this.source]), jobId]
+            );
+            totalInserted++;
+          } catch (err) { totalSkipped++; }
+        }
+
+        start += rows;
+        if (start % 5000 === 0) console.log(`[Vancouver] Progress: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+        await delay(500);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Vancouver biz lic: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Vancouver biz lic failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, merged: totalMerged, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// 3D. Calgary Business Licences — Socrata SODA API
+class CalgaryBizLicScraper {
+  constructor() {
+    this.source = 'calgary_biz_lic';
+    this.baseUrl = 'https://data.calgary.ca/resource/vdjc-pybd.json';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting Calgary business licence scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0, totalMerged = 0;
+
+    try {
+      let offset = 0;
+      const limit = 1000;
+      let hasMore = true;
+
+      while (hasMore) {
+        const response = await axios.get(this.baseUrl, {
+          params: { '$limit': limit, '$offset': offset, '$where': "jobstatusdesc='Renewal Licensed'" },
+          timeout: 30000,
+        });
+
+        const records = response.data || [];
+        totalFound += records.length;
+        if (records.length === 0) { hasMore = false; break; }
+
+        for (const f of records) {
+          const businessName = f.tradename || f.licencetypes || '';
+          if (!businessName || businessName.length < 2) continue;
+
+          const hash = nameProvinceHash(businessName, 'AB');
+          try {
+            if (hash) {
+              const existing = await dbClient.query('SELECT id, data_sources FROM scraped_smes WHERE name_province_hash = $1', [hash]);
+              if (existing.rows.length > 0) {
+                const row = existing.rows[0];
+                const sources = Array.isArray(row.data_sources) ? row.data_sources : [];
+                if (!sources.includes(this.source)) {
+                  sources.push(this.source);
+                  await dbClient.query(
+                    `UPDATE scraped_smes SET full_address = COALESCE(full_address, $2),
+                      business_type = COALESCE(business_type, $3),
+                      data_sources = $4, business_status = 'Active', updated_at = NOW() WHERE id = $1`,
+                    [row.id, f.address || null, f.licencetypes || null, JSON.stringify(sources)]
+                  );
+                }
+                totalMerged++; continue;
+              }
+            }
+
+            await dbClient.query(
+              `INSERT INTO scraped_smes (source, business_name, province, city, business_status,
+                full_address, business_type, name_province_hash, data_sources, scrape_job_id)
+               VALUES ($1,$2,'AB','Calgary','Active',$3,$4,$5,$6,$7)`,
+              [this.source, businessName, f.address || null, f.licencetypes || null,
+               hash, JSON.stringify([this.source]), jobId]
+            );
+            totalInserted++;
+          } catch (err) { totalSkipped++; }
+        }
+
+        offset += limit;
+        if (offset % 5000 === 0) console.log(`[Calgary] Progress: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+        await delay(500);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Calgary biz lic: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Calgary biz lic failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, merged: totalMerged, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// 3E. Toronto Business Licences — CKAN Open Data API
+class TorontoBizLicScraper {
+  constructor() {
+    this.source = 'toronto_biz_lic';
+    this.ckanUrl = 'https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action/package_show';
+    this.datasetId = 'municipal-licensing-and-standards-business-licences-and-permits';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting Toronto business licence scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0, totalMerged = 0;
+
+    try {
+      // Get dataset metadata to find CSV resource URL
+      const metaRes = await axios.get(this.ckanUrl, { params: { id: this.datasetId }, timeout: 30000 });
+      const resources = metaRes.data?.result?.resources || [];
+      const csvResource = resources.find(r => r.format && r.format.toLowerCase() === 'csv' && r.datastore_active);
+
+      if (!csvResource) {
+        // Fall back to datastore API
+        const datastoreUrl = 'https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action/datastore_search';
+        let offset = 0;
+        const limit = 500;
+        let hasMore = true;
+
+        // Find the first active resource
+        const activeResource = resources.find(r => r.datastore_active) || resources[0];
+        if (!activeResource) throw new Error('No resources found for Toronto business licences dataset');
+
+        while (hasMore) {
+          const response = await axios.get(datastoreUrl, {
+            params: { resource_id: activeResource.id, limit, offset },
+            timeout: 30000,
+          });
+
+          const records = response.data?.result?.records || [];
+          totalFound += records.length;
+          if (records.length === 0) { hasMore = false; break; }
+
+          for (const f of records) {
+            const businessName = f['Operating Name'] || f['Client Name'] || f['OPERATING_NAME'] || f['CLIENT_NAME'] || '';
+            if (!businessName || businessName.length < 2) continue;
+
+            const hash = nameProvinceHash(businessName, 'ON');
+            const bizType = f['Category'] || f['CATEGORY'] || f['Licence Type'] || '';
+            const address = f['Address'] || f['ADDRESS'] || '';
+
+            try {
+              if (hash) {
+                const existing = await dbClient.query('SELECT id, data_sources FROM scraped_smes WHERE name_province_hash = $1', [hash]);
+                if (existing.rows.length > 0) {
+                  const row = existing.rows[0];
+                  const sources = Array.isArray(row.data_sources) ? row.data_sources : [];
+                  if (!sources.includes(this.source)) {
+                    sources.push(this.source);
+                    await dbClient.query(
+                      `UPDATE scraped_smes SET full_address = COALESCE(full_address, $2),
+                        business_type = COALESCE(business_type, $3),
+                        data_sources = $4, business_status = 'Active', updated_at = NOW() WHERE id = $1`,
+                      [row.id, address || null, bizType || null, JSON.stringify(sources)]
+                    );
+                  }
+                  totalMerged++; continue;
+                }
+              }
+
+              await dbClient.query(
+                `INSERT INTO scraped_smes (source, business_name, province, city, business_status,
+                  full_address, business_type, name_province_hash, data_sources, scrape_job_id)
+                 VALUES ($1,$2,'ON','Toronto','Active',$3,$4,$5,$6,$7)`,
+                [this.source, businessName, address || null, bizType || null,
+                 hash, JSON.stringify([this.source]), jobId]
+              );
+              totalInserted++;
+            } catch (err) { totalSkipped++; }
+          }
+
+          offset += limit;
+          if (offset % 5000 === 0) console.log(`[Toronto] Progress: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+          await delay(500);
+        }
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Toronto biz lic: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Toronto biz lic failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, merged: totalMerged, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// 3F. Edmonton Business Licences — Socrata SODA API
+class EdmontonBizLicScraper {
+  constructor() {
+    this.source = 'edmonton_biz_lic';
+    this.baseUrl = 'https://data.edmonton.ca/resource/qhi4-bdpu.json';
+  }
+
+  async scrape(dbClient) {
+    console.log('🔍 Starting Edmonton business licence scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0, totalMerged = 0;
+
+    try {
+      let offset = 0;
+      const limit = 1000;
+      let hasMore = true;
+
+      while (hasMore) {
+        const response = await axios.get(this.baseUrl, {
+          params: { '$limit': limit, '$offset': offset },
+          timeout: 30000,
+        });
+
+        const records = response.data || [];
+        totalFound += records.length;
+        if (records.length === 0) { hasMore = false; break; }
+
+        for (const f of records) {
+          const businessName = f.trade_name || f.legal_name || '';
+          if (!businessName || businessName.length < 2) continue;
+
+          const hash = nameProvinceHash(businessName, 'AB');
+          try {
+            if (hash) {
+              const existing = await dbClient.query('SELECT id, data_sources FROM scraped_smes WHERE name_province_hash = $1', [hash]);
+              if (existing.rows.length > 0) {
+                const row = existing.rows[0];
+                const sources = Array.isArray(row.data_sources) ? row.data_sources : [];
+                if (!sources.includes(this.source)) {
+                  sources.push(this.source);
+                  await dbClient.query(
+                    `UPDATE scraped_smes SET full_address = COALESCE(full_address, $2),
+                      business_type = COALESCE(business_type, $3),
+                      data_sources = $4, business_status = 'Active', updated_at = NOW() WHERE id = $1`,
+                    [row.id, f.address || null, f.category || f.licence_type || null, JSON.stringify(sources)]
+                  );
+                }
+                totalMerged++; continue;
+              }
+            }
+
+            await dbClient.query(
+              `INSERT INTO scraped_smes (source, business_name, province, city, business_status,
+                full_address, business_type, name_province_hash, data_sources, scrape_job_id)
+               VALUES ($1,$2,'AB','Edmonton','Active',$3,$4,$5,$6,$7)`,
+              [this.source, businessName, f.address || null,
+               f.category || f.licence_type || null,
+               hash, JSON.stringify([this.source]), jobId]
+            );
+            totalInserted++;
+          } catch (err) { totalSkipped++; }
+        }
+
+        offset += limit;
+        if (offset % 5000 === 0) console.log(`[Edmonton] Progress: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+        await delay(500);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Edmonton biz lic: ${totalFound} found, ${totalInserted} new, ${totalMerged} merged`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Edmonton biz lic failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, merged: totalMerged, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 📊 BUSINESS PRIORITY SCORING ENGINE
+// =====================================================
+
+class BusinessPriorityScorer {
+  constructor() {
+    this.batchSize = 2000;
+  }
+
+  async score(dbClient) {
+    console.log('📊 Starting business priority scoring...');
+    const jobId = await this._startJob(dbClient);
+    let scored = 0;
+
+    try {
+      const { rows } = await dbClient.query(
+        `SELECT id, business_name, naics_code, industry, province, city, employee_count,
+          incorporation_date, years_in_business, directors, contact_email, website,
+          business_status, data_sources
+         FROM scraped_smes
+         WHERE queue_status_accountants = 'unscored' OR queue_status_lawyers = 'unscored' OR queue_status_investing = 'unscored'
+         LIMIT $1`,
+        [this.batchSize]
+      );
+
+      console.log(`[Scorer] Processing ${rows.length} unscored records...`);
+
+      for (const biz of rows) {
+        const acctScore = this._scoreAccountants(biz);
+        const lawScore = this._scoreLawyers(biz);
+        const invScore = this._scoreInvesting(biz);
+
+        const hasContact = !!(biz.contact_email || biz.website);
+        const hasDirectors = Array.isArray(biz.directors) && biz.directors.length > 0;
+
+        // Determine queue status based on thresholds
+        let qAcct = acctScore >= 35 && hasContact ? 'ready' : (acctScore > 0 ? 'scored' : 'not_relevant');
+        let qLaw = lawScore >= 40 && hasContact ? 'ready' : (lawScore > 0 ? 'scored' : 'not_relevant');
+        let qInv = invScore >= 45 && (hasDirectors || hasContact) ? 'ready' : (invScore > 0 ? 'scored' : 'not_relevant');
+
+        await dbClient.query(
+          `UPDATE scraped_smes SET
+            score_accountants = $2, score_lawyers = $3, score_investing = $4,
+            queue_status_accountants = $5, queue_status_lawyers = $6, queue_status_investing = $7,
+            updated_at = NOW()
+          WHERE id = $1`,
+          [biz.id, acctScore, lawScore, invScore, qAcct, qLaw, qInv]
+        );
+        scored++;
+      }
+
+      await this._completeJob(dbClient, jobId, scored, scored, 0);
+      console.log(`✅ Priority scoring complete: ${scored} records scored`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Priority scoring failed:', error.message);
+    }
+    return { scored };
+  }
+
+  _empBucket(empStr) {
+    if (!empStr) return 0;
+    const n = parseInt(empStr);
+    if (isNaN(n)) return 0;
+    if (n >= 50) return 4;
+    if (n >= 20) return 3;
+    if (n >= 10) return 2;
+    if (n >= 5) return 1;
+    return 0;
+  }
+
+  _naicsPrefix(code) {
+    return code ? String(code).substring(0, 2) : '';
+  }
+
+  _scoreAccountants(biz) {
+    let score = 0;
+    const emp = this._empBucket(biz.employee_count);
+    score += [5, 10, 15, 20, 25][emp]; // Employee count (25 max)
+
+    // Industry complexity (25 max)
+    const naics = this._naicsPrefix(biz.naics_code);
+    const complexIndustries = ['23','53','62','31','32','33','52']; // Construction, Real Estate, Healthcare, Manufacturing, Finance
+    const mediumIndustries = ['44','45','72']; // Retail, Food
+    if (complexIndustries.includes(naics)) score += 25;
+    else if (mediumIndustries.includes(naics)) score += 15;
+    else score += 10;
+
+    // Multi-province (15 max) — check data_sources for breadth
+    const sources = Array.isArray(biz.data_sources) ? biz.data_sources : [];
+    if (sources.length >= 3) score += 15;
+    else if (sources.length >= 2) score += 10;
+
+    // Contact path (10 max)
+    if (biz.contact_email || biz.website) score += 10;
+
+    // Years in business (15 max)
+    const years = biz.years_in_business || 0;
+    if (years > 10) score += 15;
+    else if (years >= 5) score += 12;
+    else if (years >= 2) score += 8;
+    else if (years > 0) score += 3;
+
+    // Active status (10 max)
+    if (!biz.business_status || biz.business_status.toLowerCase().includes('active') || biz.business_status.toLowerCase().includes('issued')) {
+      score += 10;
+    }
+
+    return Math.min(100, score);
+  }
+
+  _scoreLawyers(biz) {
+    let score = 0;
+    const naics = this._naicsPrefix(biz.naics_code);
+
+    // Industry risk profile (30 max)
+    const riskMap = { '53': 30, '23': 28, '52': 25, '62': 25, '21': 25, '31': 20, '32': 20, '33': 20, '51': 18 };
+    score += riskMap[naics] || 12;
+
+    // Employee count / employment law (20 max)
+    const emp = this._empBucket(biz.employee_count);
+    score += [4, 8, 12, 15, 20][emp];
+
+    // Regulatory complexity (20 max)
+    const regMap = { '52': 20, '62': 18, '21': 18, '22': 15, '51': 12 };
+    score += regMap[naics] || 8;
+
+    // Years in business (15 max)
+    const years = biz.years_in_business || 0;
+    if (years > 10) score += 15;
+    else if (years >= 5) score += 10;
+    else score += 5;
+
+    // Contact path (15 max)
+    if (biz.contact_email) score += 15;
+    else if (biz.website) score += 8;
+
+    return Math.min(100, score);
+  }
+
+  _scoreInvesting(biz) {
+    let score = 0;
+    const naics = this._naicsPrefix(biz.naics_code);
+
+    // Revenue estimate via employee proxy (30 max)
+    const emp = this._empBucket(biz.employee_count);
+    score += [5, 12, 20, 25, 30][emp];
+
+    // Industry wealth signals (25 max)
+    const wealthMap = { '52': 25, '53': 24, '54': 23, '55': 22, '21': 20 };
+    score += wealthMap[naics] || 10;
+
+    // Director available (15 max)
+    const hasDirectors = Array.isArray(biz.directors) && biz.directors.length > 0;
+    if (hasDirectors) score += 15;
+
+    // Years in business (20 max)
+    const years = biz.years_in_business || 0;
+    if (years > 15) score += 20;
+    else if (years >= 10) score += 15;
+    else if (years >= 5) score += 10;
+    else if (years > 0) score += 3;
+
+    // Province wealth concentration (10 max)
+    const provMap = { 'ON': 10, 'BC': 9, 'AB': 8, 'QC': 7 };
+    score += provMap[(biz.province || '').toUpperCase()] || 5;
+
+    return Math.min(100, score);
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ('priority_scoring','running') RETURNING id`); return r.rows[0].id; }
   async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
   async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
 }
@@ -2172,7 +2960,10 @@ class StatCanODBusLoader {
 // =====================================================
 
 // Expanded generic email prefixes
-const CPA_GENERIC_LOCALS = /^(info|contact|contact_us|client\.?relations|investor\.?relations|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy|billing|unsubscribe|abuse|spam|reception|general|enquiries|inquiries|accessibility|fraud|clientcare|mediarelations|wmcmediarelations|communications|media|press|compliance|legal|remittance|service|donations?|donate|team|itsecurity|solutions|feedback|mail|signs|accounting|corporatemarketing|webenquiry|centrecontact|crm|community|newsletter|events?|customerservice|frontdesk|connect|kontakt|foi\.?privacy)@/i;
+const CPA_GENERIC_LOCALS = /^(info|contact|contact_us|contactus|client\.?relations|investor\.?relations|admin|support|noreply|no-reply|hello|office|sales|marketing|hr|careers|jobs|webmaster|privacy|billing|unsubscribe|abuse|spam|reception|general|enquiries|inquiries|accessibility|fraud|clientcare|mediarelations|wmcmediarelations|communications|media|press|compliance|legal|remittance|service|donations?|donate|team|itsecurity|solutions|feedback|mail|signs|accounting|corporatemarketing|webenquiry|centrecontact|crm|community|newsletter|events?|customerservice|frontdesk|connect|kontakt|foi\.?privacy|order|leisure|lending|investors|corp|recruitment|reservations|shipping|warehouse|dispatch|returns|booking|shop|news|relais|ventas|pomoc|talent|web|people|appsupport|salesfire|newbusiness|notification|partnerships|secretariat|secretary|staplestax|taxman|socam|rotterdam)@/i;
+
+const CPA_INDUSTRY_SUFFIXES = ['cpa', 'accounting', 'tax'];
+const DNS_TIMEOUT = 3000;
 
 class FirmWebsiteEnricher {
   constructor() {
@@ -2204,12 +2995,18 @@ class FirmWebsiteEnricher {
 
     try {
       // Priority 1: CPAs with firm_name (BC provides these)
+      // Use window function to limit max 2 CPAs per firm per batch,
+      // preventing wasted budget on duplicate email collisions
       const cpasWithFirm = await dbClient.query(
         `SELECT id, first_name, last_name, full_name, firm_name, city, province
-         FROM scraped_cpas
-         WHERE firm_name IS NOT NULL AND firm_name != ''
-           AND email IS NULL AND enriched_email IS NULL
-           AND status = 'raw'
+         FROM (
+           SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(firm_name)) ORDER BY scraped_at ASC) as rn
+           FROM scraped_cpas
+           WHERE firm_name IS NOT NULL AND firm_name != ''
+             AND email IS NULL AND enriched_email IS NULL
+             AND status = 'raw'
+         ) sub
+         WHERE rn <= 2
          ORDER BY scraped_at ASC
          LIMIT $1`,
         [this.dailyLimit]
@@ -2323,43 +3120,100 @@ class FirmWebsiteEnricher {
     const firmName = cpa.firm_name;
     if (!firmName) return null;
 
-    // Generate possible domain variations from firm name
-    const firmSlug = firmName.toLowerCase()
-      .replace(/[^a-z0-9\s]/g, '')
-      .replace(/\b(llp|inc|ltd|corp|corporation|limited|professional|group|associates)\b/g, '')
-      .trim().replace(/\s+/g, '');
+    const possibleDomains = this._generateDomainSlugs(firmName);
+    if (possibleDomains.length === 0) return null;
 
-    // Also try with hyphens instead of removing spaces
-    const firmSlugHyphen = firmName.toLowerCase()
-      .replace(/[^a-z0-9\s]/g, '')
-      .replace(/\b(llp|inc|ltd|corp|corporation|limited|professional|group|associates)\b/g, '')
-      .trim().replace(/\s+/g, '-');
-
-    const possibleDomains = [];
-    if (firmSlug.length >= 3) {
-      possibleDomains.push(`${firmSlug}.ca`, `${firmSlug}.com`);
-    }
-    if (firmSlugHyphen.length >= 3 && firmSlugHyphen !== firmSlug) {
-      possibleDomains.push(`${firmSlugHyphen}.ca`, `${firmSlugHyphen}.com`);
-    }
+    let confirmedDomain = null;
 
     for (const domain of possibleDomains) {
       try {
-        const email = await this._scrapeWebsiteForEmail(domain, cpa);
+        const { email, domainLive } = await this._scrapeWebsiteForEmail(domain, cpa);
+        if (domainLive && !confirmedDomain) confirmedDomain = domain;
         if (email) {
-          // Update firm_website in DB
           await dbClient.query(
             `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1`,
             [cpa.id, domain]
           );
-          return { email, source: 'firm_website' };
+          return { email, source: `firm_website:${domain}` };
         }
       } catch (err) {
         continue;
       }
     }
 
+    // Pattern generation fallback: domain was live but no email scraped
+    if (confirmedDomain) {
+      const hasMx = await this._domainAcceptsMail(confirmedDomain);
+      if (hasMx) {
+        const patterns = this._generatePatternEmails(cpa.first_name, cpa.last_name, confirmedDomain);
+        if (patterns.length > 0) {
+          await dbClient.query(
+            `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1 AND firm_website IS NULL`,
+            [cpa.id, `https://${confirmedDomain}`]
+          );
+          return { email: patterns[0], source: `email_pattern:${confirmedDomain}` };
+        }
+      }
+    }
+
     return null;
+  }
+
+  _generateDomainSlugs(firmName) {
+    if (!firmName) return [];
+    const clean = firmName.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\b(llp|inc|ltd|corp|corporation|limited|professional|group|associates)\b/g, '')
+      .trim();
+    if (!clean || clean.length < 2) return [];
+
+    const words = clean.split(/\s+/).filter(w => w.length > 0);
+    if (words.length === 0) return [];
+
+    const slugs = new Set();
+    const compact = words.join('');
+    slugs.add(`${compact}.ca`);
+    slugs.add(`${compact}.com`);
+    slugs.add(`${compact}.net`);
+    slugs.add(`${compact}.org`);
+
+    if (words.length > 1) {
+      const hyphenated = words.join('-');
+      slugs.add(`${hyphenated}.ca`);
+      slugs.add(`${hyphenated}.com`);
+    }
+
+    if (words.length > 2) {
+      const first2 = words.slice(0, 2).join('');
+      slugs.add(`${first2}.ca`);
+      slugs.add(`${first2}.com`);
+    }
+
+    // First word only (e.g., "Deloitte Canada LLP" → deloitte.ca)
+    if (words.length > 1 && words[0].length >= 4) {
+      slugs.add(`${words[0]}.ca`);
+      slugs.add(`${words[0]}.com`);
+    }
+
+    // Abbreviation (initials)
+    if (words.length >= 2 && words.length <= 5) {
+      const abbr = words.map(w => w[0]).join('');
+      if (abbr.length >= 2) {
+        slugs.add(`${abbr}.ca`);
+        slugs.add(`${abbr}.com`);
+      }
+    }
+
+    // Industry keyword slugs
+    const base = words[0];
+    if (base.length >= 3) {
+      for (const suffix of CPA_INDUSTRY_SUFFIXES) {
+        slugs.add(`${base}${suffix}.ca`);
+        slugs.add(`${base}${suffix}.com`);
+      }
+    }
+
+    return [...slugs];
   }
 
   // Strategy 2: No firm name — crawl large CPA firm team/people pages and match names
@@ -2383,6 +3237,26 @@ class FirmWebsiteEnricher {
       { domain: 'dmcl.ca', name: 'DMCL', teamPages: ['/team/', '/our-team/'] },
       { domain: 'clearlinecpa.ca', name: 'Clearline CPA', teamPages: ['/team/', '/our-team/'] },
       { domain: 'rcmycpa.ca', name: 'RCM CPA', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'deloitte.com', name: 'Deloitte', teamPages: ['/ca/en/profiles/'] },
+      { domain: 'pwc.com', name: 'PwC', teamPages: ['/ca/en/contacts.html?'] },
+      { domain: 'ey.com', name: 'EY', teamPages: ['/en_ca/people/'] },
+      { domain: 'kpmg.com', name: 'KPMG', teamPages: ['/ca/en/home/contacts.html?'] },
+      { domain: 'rsm.ca', name: 'RSM Canada', teamPages: ['/our-people?search='] },
+      { domain: 'crowesoberman.com', name: 'Crowe Soberman', teamPages: ['/team/', '/our-people/'] },
+      { domain: 'richter.ca', name: 'Richter', teamPages: ['/en/team/', '/en/our-people/'] },
+      { domain: 'fullerlandau.com', name: 'Fuller Landau', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'zeifmans.ca', name: 'Zeifmans', teamPages: ['/team/', '/our-people/'] },
+      { domain: 'rlb.ca', name: 'RLB LLP', teamPages: ['/team/', '/our-people/'] },
+      { domain: 'fbc.ca', name: 'FBC', teamPages: ['/about-us/our-team/'] },
+      { domain: 'doanegrantthornton.ca', name: 'Doane Grant Thornton', teamPages: ['/en/people?search='] },
+      { domain: 'marcillavallee.ca', name: 'Marcil Lavallee', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'sbpartners.ca', name: 'SB Partners', teamPages: ['/team/', '/our-people/'] },
+      { domain: 'taylorlieberman.com', name: 'Taylor Lieberman', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'mdd.com', name: 'MDD Forensic Accountants', teamPages: ['/our-people/', '/team/'] },
+      { domain: 'sfpartnership.ca', name: 'SF Partnership', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'lfrgroup.ca', name: 'LFR Group', teamPages: ['/team/', '/our-team/'] },
+      { domain: 'dfrg.ca', name: 'DNTW', teamPages: ['/team/', '/our-people/'] },
+      { domain: 'pfrgroup.ca', name: 'PFR Group', teamPages: ['/team/', '/our-team/'] },
     ];
 
     for (const firm of largeFirms) {
@@ -2412,11 +3286,14 @@ class FirmWebsiteEnricher {
             const foundEmails = html.match(emailRegex) || [];
 
             for (const email of foundEmails) {
-              if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
-              if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
+              if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js|webp|ico|woff|woff2|ttf|eot|map)$/i)) continue;
+              if (email.match(/^(example|test|user|email|someone|yourname|your|youremail|your\.?address|your\.?email|your\.?name|name|username|sampleemail)@/i)) continue;
               if (CPA_GENERIC_LOCALS.test(email)) continue;
-              if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.)/i)) continue;
+              if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.|domainmarket\.|email\.com)/i)) continue;
               if (email.split('@')[0].length < 3) continue;
+              if (email.match(/^(shop|news|relais|ventas|pomoc|talent|web|people|appsupport|salesfire|newbusiness|notification|partnerships|right\.info|secretariat|secretary|staplestax|taxman|x{2,}|order|leisure|lending|investors|corp|contactus|contact_us|recruitment|reservations|shipping|warehouse|dispatch|returns|booking|socam|rotterdam)@/i)) continue;
+              if (email.match(/^u003e/i)) continue;
+              { const lp = email.split('@')[0]; if (lp.length > 8 && (lp.match(/[aeiou]/gi) || []).length / lp.length < 0.15) continue; }
 
               const emailLower = email.toLowerCase();
               const localPart = emailLower.split('@')[0];
@@ -2456,11 +3333,23 @@ class FirmWebsiteEnricher {
 
   // Scrape a website for email addresses, prioritizing name matches
   async _scrapeWebsiteForEmail(domain, cpa) {
-    const pages = [`https://${domain}`, `https://${domain}/contact`, `https://${domain}/team`, `https://${domain}/about`, `https://${domain}/our-team`, `https://${domain}/people`];
+    // DNS pre-check — skip domains that don't resolve
+    try {
+      await Promise.race([
+        dns.resolve4(domain),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DNS timeout')), DNS_TIMEOUT))
+      ]);
+    } catch (err) {
+      return { email: null, domainLive: false };
+    }
+
+    const pages = [`https://${domain}`, `https://${domain}/contact`, `https://${domain}/team`, `https://${domain}/about`, `https://${domain}/our-team`, `https://${domain}/people`,
+                    `https://${domain}/professionals`, `https://${domain}/about-us`, `https://${domain}/meet-the-team`, `https://${domain}/staff`, `https://${domain}/partners`, `https://${domain}/services`];
     const allEmails = new Set();
     const nameMatchEmails = [];
     const firstName = (cpa.first_name || '').toLowerCase();
     const lastName = (cpa.last_name || '').toLowerCase();
+    let anyPageLoaded = false;
 
     for (const url of pages) {
       try {
@@ -2470,29 +3359,26 @@ class FirmWebsiteEnricher {
           maxRedirects: 3,
           validateStatus: (s) => s < 400,
         });
+        anyPageLoaded = true;
 
         const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-        const found = response.data.match(emailRegex) || [];
+        const found = (typeof response.data === 'string' ? response.data : '').match(emailRegex) || [];
 
         for (const email of found) {
-          // Skip image/asset false positives
           if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js|webp|ico|woff|woff2|ttf|eot|map)$/i)) continue;
           if (email.match(/\d+x\d*\./)) continue;
-          // Skip dummy/example/template addresses
-          if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
-          // Skip generic corporate prefixes
+          if (email.match(/^(example|test|user|email|someone|yourname|your|youremail|your\.?address|your\.?email|your\.?name|name|username|sampleemail)@/i)) continue;
           if (CPA_GENERIC_LOCALS.test(email)) continue;
-          // Skip dummy/template domains
-          if (email.match(/@(mysite|yoursite|yourdomain|domain|website|site|example|sentry|wixpress|mailchimp|placeholder|test)\./i)) continue;
-          // Skip known template/framework artifact emails
+          if (email.match(/@(mysite|yoursite|yourdomain|domain|website|site|example|sentry|wixpress|mailchimp|placeholder|test|domainmarket|email)\./i)) continue;
           if (email.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)) continue;
-          // Skip very short local parts (likely false positives like "a@b.com")
           if (email.split('@')[0].length < 3) continue;
+          if (email.match(/^(shop|news|relais|ventas|pomoc|talent|web|people|appsupport|salesfire|newbusiness|notification|partnerships|right\.info|secretariat|secretary|staplestax|taxman|x{2,})@/i)) continue;
+          if (email.match(/^u003e/i)) continue;
+          { const lp = email.split('@')[0]; if (lp.length > 8 && (lp.match(/[aeiou]/gi) || []).length / lp.length < 0.15) continue; }
 
           allEmails.add(email);
           const emailLower = email.toLowerCase();
 
-          // Check if email contains CPA's name
           if (firstName.length >= 2 && emailLower.includes(firstName)) {
             nameMatchEmails.push(email);
           } else if (lastName.length >= 2 && emailLower.includes(lastName)) {
@@ -2502,17 +3388,53 @@ class FirmWebsiteEnricher {
       } catch (err) {
         continue;
       }
-      await delay(1000); // 1s between pages on same domain
+      await delay(1000);
     }
 
-    // Priority: name-matched email > non-generic email > generic email
-    if (nameMatchEmails.length > 0) return nameMatchEmails[0];
+    // Priority: name-matched email > non-generic email > solo practitioner fallback
+    if (nameMatchEmails.length > 0) return { email: nameMatchEmails[0], domainLive: anyPageLoaded };
 
     const nonGeneric = [...allEmails].filter(e => !CPA_GENERIC_LOCALS.test(e));
-    if (nonGeneric.length > 0) return nonGeneric[0];
+    if (nonGeneric.length > 0) return { email: nonGeneric[0], domainLive: anyPageLoaded };
 
-    // Don't return generic emails at all — they waste outreach cycles
-    return null;
+    // Solo practitioner fallback
+    if (this._isSoloPractice(cpa.firm_name, cpa.last_name)) {
+      const anyValid = [...allEmails].filter(e =>
+        !e.match(/@(mysite|yoursite|yourdomain|domain|website|site|example|sentry|wixpress|mailchimp|placeholder|test)\./i) &&
+        !e.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)
+      );
+      if (anyValid.length === 1) return { email: anyValid[0], domainLive: anyPageLoaded };
+    }
+
+    return { email: null, domainLive: anyPageLoaded };
+  }
+
+  _generatePatternEmails(firstName, lastName, domain) {
+    if (!firstName || !lastName || firstName.length < 2 || lastName.length < 2) return [];
+    const f = firstName.toLowerCase().replace(/[^a-z]/g, '');
+    const l = lastName.toLowerCase().replace(/[^a-z]/g, '');
+    if (!f || !l) return [];
+    return [
+      `${f}.${l}@${domain}`,
+      `${f}${l}@${domain}`,
+      `${f[0]}${l}@${domain}`,
+      `${f}@${domain}`,
+    ];
+  }
+
+  async _domainAcceptsMail(domain) {
+    try {
+      const records = await Promise.race([
+        dns.resolveMx(domain),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('MX timeout')), DNS_TIMEOUT))
+      ]);
+      return records && records.length > 0;
+    } catch { return false; }
+  }
+
+  _isSoloPractice(firmName, lastName) {
+    if (!firmName || !lastName) return false;
+    return firmName.toLowerCase().includes(lastName.toLowerCase());
   }
 
   async _startJob(dbClient) {
@@ -2528,21 +3450,23 @@ class FirmWebsiteEnricher {
 }
 
 // =====================================================
-// 📧 SME EMAIL ENRICHMENT PIPELINE
+// 📧 SME EMAIL ENRICHMENT PIPELINE (Enhanced 3-Stage)
 // =====================================================
 
 class SMEEmailEnricher {
   constructor() {
-    this.dailyLimit = 300;
-    this.delayMs = 3000;
+    this.batchLimit = 2000;
+    this.delayMs = 1500;
+    this.batchSize = 5; // parallel mini-batch size
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
     this.running = false;
+    this.smtpAvailable = null; // null = untested, true/false after first test
   }
 
   async enrich(dbClient) {
     if (this.running) {
       console.log('[SME Enrichment] Already running, skipping duplicate trigger');
-      return { processed: 0, enriched: 0 };
+      return { processed: 0, enriched: 0, websitesFound: 0 };
     }
     this.running = true;
 
@@ -2555,92 +3479,211 @@ class SMEEmailEnricher {
       if (cleaned.rowCount > 0) console.log(`[SME Enrichment] Cleaned up ${cleaned.rowCount} stale jobs`);
     } catch (e) { /* ignore */ }
 
-    console.log('📧 Starting SME email enrichment pipeline...');
+    console.log('📧 Starting enhanced SME email enrichment pipeline...');
     const jobId = await this._startJob(dbClient);
-    let totalProcessed = 0, totalEnriched = 0;
+    let totalProcessed = 0, totalEnriched = 0, totalWebsites = 0;
 
     try {
-      // Get SMEs with business_name but no contact_email, not yet attempted
+      // Prioritize: 1) records WITH website but no email, 2) records with no website
       const smes = await dbClient.query(
-        `SELECT id, business_name, province, city, naics_code, industry, website
+        `SELECT id, business_name, province, city, naics_code, industry, website, enrichment_attempts
          FROM scraped_smes
          WHERE contact_email IS NULL
            AND (status IS NULL OR status = 'raw' OR status = 'active')
            AND business_name IS NOT NULL AND business_name != ''
-         ORDER BY scraped_at ASC
+         ORDER BY
+           website IS NOT NULL DESC,
+           GREATEST(COALESCE(score_accountants,0), COALESCE(score_lawyers,0), COALESCE(score_investing,0)) DESC NULLS LAST,
+           scraped_at ASC
          LIMIT $1`,
-        [this.dailyLimit]
+        [this.batchLimit]
       );
 
       console.log(`[SME Enrichment] Found ${smes.rows.length} SMEs to enrich`);
 
-      for (const sme of smes.rows) {
-        totalProcessed++;
-        try {
-          const result = await this._findEmailForSME(sme, dbClient);
-          if (result) {
-            await dbClient.query(
-              `UPDATE scraped_smes SET contact_email = $2, website = COALESCE(website, $3), enrichment_source = $4, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
-              [sme.id, result.email, result.website || null, result.source]
-            );
-            totalEnriched++;
-          } else {
-            await dbClient.query(
-              `UPDATE scraped_smes SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
-              [sme.id]
-            );
+      // Test SMTP port 25 availability once per run
+      if (this.smtpAvailable === null) {
+        this.smtpAvailable = await this._testSmtpPort();
+        console.log(`[SME Enrichment] SMTP port 25 ${this.smtpAvailable ? 'available' : 'blocked'}`);
+      }
+
+      // Process in mini-batches of 5
+      for (let i = 0; i < smes.rows.length; i += this.batchSize) {
+        const batch = smes.rows.slice(i, i + this.batchSize);
+        const results = await Promise.allSettled(
+          batch.map(sme => this._processSME(sme, dbClient))
+        );
+
+        for (let j = 0; j < results.length; j++) {
+          totalProcessed++;
+          const result = results[j];
+          if (result.status === 'fulfilled' && result.value) {
+            if (result.value.email) totalEnriched++;
+            if (result.value.websiteFound) totalWebsites++;
           }
-        } catch (err) {
-          console.error(`[SME Enrichment] Error for SME ${sme.id} (${sme.business_name}):`, err.message);
-          await dbClient.query(
-            `UPDATE scraped_smes SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
-            [sme.id]
-          );
         }
-        if (totalProcessed % 20 === 0) {
-          console.log(`[SME Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
+
+        if (totalProcessed % 50 === 0) {
+          console.log(`[SME Enrichment] Progress: ${totalProcessed}/${smes.rows.length} processed, ${totalEnriched} emails, ${totalWebsites} websites`);
         }
         await delay(this.delayMs);
       }
 
       await this._completeJob(dbClient, jobId, totalProcessed, totalEnriched);
-      console.log(`✅ SME Enrichment complete: ${totalProcessed} processed, ${totalEnriched} enriched`);
+      console.log(`✅ SME Enrichment complete: ${totalProcessed} processed, ${totalEnriched} emails found, ${totalWebsites} websites found`);
     } catch (error) {
       await this._failJob(dbClient, jobId, error.message);
       console.error('❌ SME Enrichment failed:', error.message);
     }
 
     this.running = false;
-    return { processed: totalProcessed, enriched: totalEnriched };
+    return { processed: totalProcessed, enriched: totalEnriched, websitesFound: totalWebsites };
+  }
+
+  async _processSME(sme, dbClient) {
+    try {
+      const result = await this._findEmailForSME(sme, dbClient);
+      if (result && result.email) {
+        const updateFields = [
+          'contact_email = $2',
+          'website = COALESCE(website, $3)',
+          'enrichment_source = $4',
+          'enrichment_date = NOW()',
+          "status = 'enriched'",
+          'updated_at = NOW()',
+          'enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1',
+        ];
+        const params = [sme.id, result.email, result.website || null, result.source];
+        let paramIdx = 5;
+
+        if (result.verified !== undefined) {
+          updateFields.push(`email_verified = $${paramIdx++}`);
+          params.push(result.verified);
+        }
+        if (result.verificationMethod) {
+          updateFields.push(`email_verification_method = $${paramIdx++}`);
+          params.push(result.verificationMethod);
+        }
+        if (result.websiteSource) {
+          updateFields.push(`website_source = COALESCE(website_source, $${paramIdx++})`);
+          params.push(result.websiteSource);
+        }
+        updateFields.push(`enrichment_phase = $${paramIdx++}`);
+        params.push(result.phase || 'email_found');
+
+        await dbClient.query(
+          `UPDATE scraped_smes SET ${updateFields.join(', ')} WHERE id = $1`,
+          params
+        );
+        return { email: true, websiteFound: !!result.website };
+      } else if (result && result.website) {
+        // Website found but no email — still valuable, save it
+        await dbClient.query(
+          `UPDATE scraped_smes SET website = $2, website_source = $3, enrichment_phase = 'website_only',
+           enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1, updated_at = NOW(),
+           status = CASE WHEN status IN ('raw', 'active') THEN 'enrichment_attempted' ELSE status END
+           WHERE id = $1 AND website IS NULL`,
+          [sme.id, result.website, result.websiteSource || 'domain_guess']
+        );
+        return { email: false, websiteFound: true };
+      } else {
+        await dbClient.query(
+          `UPDATE scraped_smes SET status = 'enrichment_attempted',
+           enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1,
+           enrichment_phase = 'no_domain', updated_at = NOW() WHERE id = $1`,
+          [sme.id]
+        );
+        return { email: false, websiteFound: false };
+      }
+    } catch (err) {
+      console.error(`[SME Enrichment] Error for SME ${sme.id} (${sme.business_name}):`, err.message);
+      await dbClient.query(
+        `UPDATE scraped_smes SET status = 'enrichment_attempted',
+         enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1, updated_at = NOW() WHERE id = $1`,
+        [sme.id]
+      );
+      return null;
+    }
   }
 
   async _findEmailForSME(sme, dbClient) {
     const businessName = sme.business_name;
     if (!businessName) return null;
 
-    // Generate domain variations from business name
-    // Remove corporate suffixes and clean up
+    // Stage 1: If SME already has a website (from directory enrichment), scrape it directly
+    if (sme.website) {
+      try {
+        const domain = new URL(sme.website).hostname.replace(/^www\./, '');
+        const email = await this._scrapeWebsiteForEmail(domain, sme);
+        if (email) {
+          const verified = await this._verifyEmail(email);
+          return { email, website: sme.website, source: `website:${domain}`, websiteSource: 'existing', phase: 'scraped_existing', ...verified };
+        }
+        // Website exists but no email scraped — try MX pattern generation
+        const patternResult = await this._tryPatternEmails(domain);
+        if (patternResult) {
+          return { email: patternResult.email, website: sme.website, source: `pattern:${domain}`, websiteSource: 'existing', phase: 'pattern_gen', ...patternResult };
+        }
+        return { website: sme.website, websiteSource: 'existing' };
+      } catch (err) {
+        // Invalid URL, fall through to domain guessing
+      }
+    }
+
+    // Stage 2: Generate domain variations from business name + DNS pre-check
+    const possibleDomains = this._generateDomainVariations(businessName);
+    if (possibleDomains.size === 0) return null;
+
+    // Batch DNS check — filter to only live domains
+    const liveDomains = await this._filterLiveDomains(possibleDomains);
+
+    if (liveDomains.length === 0) return null;
+
+    // Save the first live domain as website even if we don't find email
+    const firstLiveDomain = liveDomains[0];
+    let foundWebsite = `https://${firstLiveDomain}`;
+
+    // Scrape each live domain for emails
+    for (const domain of liveDomains) {
+      try {
+        const email = await this._scrapeWebsiteForEmail(domain, sme);
+        if (email) {
+          const verified = await this._verifyEmail(email);
+          return { email, website: `https://${domain}`, source: `website:${domain}`, websiteSource: 'domain_guess', phase: 'scraped_guessed', ...verified };
+        }
+      } catch (err) {
+        continue;
+      }
+    }
+
+    // Stage 3: No email scraped from any live domain — try MX pattern generation on first live domain
+    const patternResult = await this._tryPatternEmails(firstLiveDomain);
+    if (patternResult) {
+      return { email: patternResult.email, website: foundWebsite, source: `pattern:${firstLiveDomain}`, websiteSource: 'domain_guess', phase: 'pattern_gen', ...patternResult };
+    }
+
+    // Return website discovery even without email
+    return { website: foundWebsite, websiteSource: 'domain_guess' };
+  }
+
+  _generateDomainVariations(businessName) {
     const cleaned = businessName.toLowerCase()
       .replace(/\b(inc|ltd|llc|llp|corp|corporation|limited|co|company|enterprises|holdings|group|partners|solutions|services|consulting|technologies|international|canada|canadian|ontario|toronto|vancouver|calgary|ottawa|montreal)\b/gi, '')
       .replace(/[^a-z0-9\s]/g, '')
       .trim();
 
-    if (cleaned.length < 3) return null;
+    if (cleaned.length < 3) return new Set();
 
-    // Generate slug variations
     const words = cleaned.split(/\s+/).filter(w => w.length >= 2);
-    if (words.length === 0) return null;
+    if (words.length === 0) return new Set();
 
     const slug = words.join('');
     const slugHyphen = words.join('-');
-    // First letters of each word (acronym)
     const acronym = words.map(w => w[0]).join('');
-    // First two words only (common pattern)
     const shortSlug = words.slice(0, 2).join('');
     const shortSlugHyphen = words.slice(0, 2).join('-');
 
     const possibleDomains = new Set();
-    // Priority order: .ca first (Canadian businesses), then .com
     if (slug.length >= 3 && slug.length <= 40) {
       possibleDomains.add(`${slug}.ca`);
       possibleDomains.add(`${slug}.com`);
@@ -2657,33 +3700,32 @@ class SMEEmailEnricher {
       possibleDomains.add(`${shortSlugHyphen}.ca`);
       possibleDomains.add(`${shortSlugHyphen}.com`);
     }
-    // Acronyms only for 3+ letter ones to avoid too many false positives
     if (acronym.length >= 3) {
       possibleDomains.add(`${acronym}.ca`);
       possibleDomains.add(`${acronym}.com`);
     }
+    return possibleDomains;
+  }
 
-    for (const domain of possibleDomains) {
-      try {
-        const email = await this._scrapeWebsiteForEmail(domain, sme);
-        if (email) {
-          return { email, website: `https://${domain}`, source: `website:${domain}` };
-        }
-      } catch (err) {
-        continue;
-      }
-    }
-
-    return null;
+  // Batch-filter domains via parallel DNS lookups
+  async _filterLiveDomains(domains) {
+    const results = await Promise.allSettled(
+      [...domains].map(d => Promise.race([
+        dns.resolve4(d).then(() => d),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('DNS timeout')), DNS_TIMEOUT))
+      ]))
+    );
+    return results.filter(r => r.status === 'fulfilled').map(r => r.value);
   }
 
   async _scrapeWebsiteForEmail(domain, sme) {
-    // For SMEs, we WANT generic emails (info@, contact@, office@) — we're emailing the business
     const pages = [
-      `https://${domain}`,
-      `https://${domain}/contact`,
-      `https://${domain}/contact-us`,
-      `https://${domain}/about`,
+      `https://${domain}`, `https://${domain}/contact`, `https://${domain}/contact-us`,
+      `https://${domain}/about`, `https://${domain}/about-us`, `https://${domain}/team`,
+      `https://${domain}/our-team`, `https://${domain}/staff`, `https://${domain}/people`,
+      `https://${domain}/services`, `https://${domain}/location`, `https://${domain}/locations`,
+      `https://${domain}/partners`, `https://${domain}/cpas`, `https://${domain}/our-cpas`,
+      `https://${domain}/accountants`, `https://${domain}/tax-professionals`,
     ];
     const allEmails = new Set();
 
@@ -2696,21 +3738,17 @@ class SMEEmailEnricher {
           validateStatus: (s) => s < 400,
         });
 
+        const html = typeof response.data === 'string' ? response.data : '';
         const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-        const found = response.data.match(emailRegex) || [];
+        const found = html.match(emailRegex) || [];
 
         for (const email of found) {
-          // Skip image/asset false positives
-          if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js)$/i)) continue;
-          // Skip dummy/example/template addresses
+          if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js|webp|ico|woff|woff2|ttf|eot|map)$/i)) continue;
+          if (email.match(/\d+x\d*\./)) continue;
           if (email.match(/^(example|test|user|email|someone|yourname|name|username|sampleemail)@/i)) continue;
-          // Skip dummy domains
-          if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.|googleapis\.|w3\.org)/i)) continue;
-          // Skip framework artifacts
+          if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.|googleapis\.|w3\.org|mysite\.|yoursite\.|yourdomain\.|domain\.|website\.|site\.)/i)) continue;
           if (email.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)) continue;
-          // Skip very short local parts
           if (email.split('@')[0].length < 3) continue;
-          // Skip noreply addresses
           if (email.match(/^(noreply|no-reply|donotreply|mailer-daemon|postmaster|webmaster)@/i)) continue;
 
           allEmails.add(email.toLowerCase());
@@ -2718,19 +3756,18 @@ class SMEEmailEnricher {
       } catch (err) {
         continue;
       }
-      await delay(1000);
+      await delay(500);
     }
 
     if (allEmails.size === 0) return null;
 
-    // For SMEs: prioritize business-appropriate emails
     // Priority 1: info@, contact@, office@, hello@ (best for business outreach)
     const businessEmails = [...allEmails].filter(e =>
       e.match(/^(info|contact|office|hello|enquiries|inquiries|reception|general)@/i)
     );
     if (businessEmails.length > 0) return businessEmails[0];
 
-    // Priority 2: Any email at the domain we're scraping (not support/hr/careers)
+    // Priority 2: Any email at the domain (not support/hr/careers)
     const domainEmails = [...allEmails].filter(e => {
       const emailDomain = e.split('@')[1];
       return emailDomain === domain && !e.match(/^(support|hr|careers|jobs|noreply|no-reply|privacy|abuse|spam|billing|unsubscribe|marketing|sales)@/i);
@@ -2742,6 +3779,139 @@ class SMEEmailEnricher {
     if (sameDomain.length > 0) return sameDomain[0];
 
     return null;
+  }
+
+  // Check if domain has MX records (can receive email)
+  async _domainAcceptsMail(domain) {
+    try {
+      const records = await Promise.race([
+        dns.resolveMx(domain),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('MX timeout')), DNS_TIMEOUT))
+      ]);
+      return records && records.length > 0;
+    } catch { return false; }
+  }
+
+  // Try standard email patterns when we have a live domain with MX but no scraped email
+  async _tryPatternEmails(domain) {
+    const hasMx = await this._domainAcceptsMail(domain);
+    if (!hasMx) return null;
+
+    const patterns = [
+      `info@${domain}`, `contact@${domain}`, `hello@${domain}`,
+      `office@${domain}`, `admin@${domain}`,
+    ];
+
+    // Detect catch-all: test a random address first
+    if (this.smtpAvailable) {
+      const catchAllTest = await this._smtpVerify(`xyzrandom98765@${domain}`);
+      if (catchAllTest === 'valid') {
+        // Catch-all domain — accept info@ with lower confidence, no SMTP verify needed
+        return { email: `info@${domain}`, verified: false, verificationMethod: 'mx_catchall' };
+      }
+
+      // Not catch-all — verify each pattern via SMTP
+      for (const email of patterns) {
+        const result = await this._smtpVerify(email);
+        if (result === 'valid') {
+          return { email, verified: true, verificationMethod: 'smtp_rcpt' };
+        }
+      }
+      return null;
+    }
+
+    // SMTP blocked — fall back to MX-only verification, accept info@ with low confidence
+    return { email: `info@${domain}`, verified: false, verificationMethod: 'mx_only' };
+  }
+
+  // Verify an email via SMTP RCPT TO
+  async _smtpVerify(email) {
+    if (!this.smtpAvailable) return 'unknown';
+    const domain = email.split('@')[1];
+
+    try {
+      // Get MX records
+      const mxRecords = await Promise.race([
+        dns.resolveMx(domain),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('MX timeout')), DNS_TIMEOUT))
+      ]);
+      if (!mxRecords || mxRecords.length === 0) return 'invalid';
+
+      // Sort by priority (lowest = highest priority)
+      mxRecords.sort((a, b) => a.priority - b.priority);
+      const mxHost = mxRecords[0].exchange;
+
+      return await new Promise((resolve) => {
+        const socket = new net.Socket();
+        let step = 0;
+        let response = '';
+        const timeout = setTimeout(() => { socket.destroy(); resolve('unknown'); }, 10000);
+
+        socket.connect(25, mxHost, () => {});
+
+        socket.on('data', (data) => {
+          response = data.toString();
+          const code = parseInt(response.substring(0, 3));
+
+          if (step === 0 && code === 220) {
+            socket.write(`EHLO verify.canadaaccountants.app\r\n`);
+            step = 1;
+          } else if (step === 1 && code === 250) {
+            socket.write(`MAIL FROM:<verify@canadaaccountants.app>\r\n`);
+            step = 2;
+          } else if (step === 2 && code === 250) {
+            socket.write(`RCPT TO:<${email}>\r\n`);
+            step = 3;
+          } else if (step === 3) {
+            socket.write('QUIT\r\n');
+            clearTimeout(timeout);
+            if (code === 250) resolve('valid');
+            else if (code === 550 || code === 551 || code === 553) resolve('invalid');
+            else if (code === 252) resolve('valid'); // 252 = cannot verify but will accept
+            else resolve('unknown');
+            socket.destroy();
+          } else {
+            clearTimeout(timeout);
+            socket.write('QUIT\r\n');
+            resolve('unknown');
+            socket.destroy();
+          }
+        });
+
+        socket.on('error', () => { clearTimeout(timeout); resolve('unknown'); });
+        socket.on('timeout', () => { clearTimeout(timeout); socket.destroy(); resolve('unknown'); });
+      });
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  // Test if outbound port 25 is available (Railway may block it)
+  async _testSmtpPort() {
+    try {
+      return await new Promise((resolve) => {
+        const socket = new net.Socket();
+        const timeout = setTimeout(() => { socket.destroy(); resolve(false); }, 5000);
+        // Test against a known MX server (Google)
+        socket.connect(25, 'alt1.gmail-smtp-in.l.google.com', () => {
+          clearTimeout(timeout);
+          socket.write('QUIT\r\n');
+          socket.destroy();
+          resolve(true);
+        });
+        socket.on('error', () => { clearTimeout(timeout); resolve(false); });
+      });
+    } catch { return false; }
+  }
+
+  // Wrapper to verify email if SMTP available
+  async _verifyEmail(email) {
+    if (!this.smtpAvailable) return { verified: false, verificationMethod: 'none' };
+    const result = await this._smtpVerify(email);
+    return {
+      verified: result === 'valid',
+      verificationMethod: result === 'valid' ? 'smtp_rcpt' : (result === 'invalid' ? 'smtp_invalid' : 'smtp_unknown'),
+    };
   }
 
   async _startJob(dbClient) {
@@ -2756,12 +3926,1496 @@ class SMEEmailEnricher {
   }
 }
 
+// =====================================================
+// 🌐 YELLOWPAGES.CA WEBSITE DISCOVERY
+// =====================================================
+
+class YellowPagesWebsiteEnricher {
+  constructor() {
+    this.batchLimit = 500;
+    this.delayMs = 5000;
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.running = false;
+  }
+
+  async enrich(dbClient) {
+    if (this.running) {
+      console.log('[YellowPages] Already running, skipping');
+      return { processed: 0, found: 0 };
+    }
+    this.running = true;
+
+    console.log('🌐 Starting YellowPages website discovery...');
+    const jobId = await this._startJob(dbClient);
+    let totalProcessed = 0, totalFound = 0;
+
+    try {
+      // Get SMEs without a website, prioritized by score
+      const smes = await dbClient.query(
+        `SELECT id, business_name, province, city
+         FROM scraped_smes
+         WHERE website IS NULL
+           AND business_name IS NOT NULL AND business_name != ''
+           AND (enrichment_phase IS NULL OR enrichment_phase = 'pending' OR enrichment_phase = 'no_domain')
+         ORDER BY
+           GREATEST(COALESCE(score_accountants,0), COALESCE(score_lawyers,0), COALESCE(score_investing,0)) DESC NULLS LAST,
+           id ASC
+         LIMIT $1`,
+        [this.batchLimit]
+      );
+
+      console.log(`[YellowPages] Found ${smes.rows.length} SMEs to look up`);
+
+      for (const sme of smes.rows) {
+        totalProcessed++;
+        try {
+          const result = await this._lookupBusiness(sme);
+          if (result && result.website) {
+            await dbClient.query(
+              `UPDATE scraped_smes SET website = $2, website_source = 'yellowpages',
+               phone = COALESCE(phone, $3), enrichment_phase = 'website_found',
+               updated_at = NOW() WHERE id = $1`,
+              [sme.id, result.website, result.phone || null]
+            );
+            totalFound++;
+          } else {
+            await dbClient.query(
+              `UPDATE scraped_smes SET enrichment_phase = 'yp_no_match', updated_at = NOW() WHERE id = $1`,
+              [sme.id]
+            );
+          }
+        } catch (err) {
+          console.error(`[YellowPages] Error for ${sme.business_name}:`, err.message);
+        }
+
+        if (totalProcessed % 50 === 0) {
+          console.log(`[YellowPages] Progress: ${totalProcessed}/${smes.rows.length}, found ${totalFound} websites`);
+        }
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalProcessed, totalFound);
+      console.log(`✅ YellowPages discovery: ${totalProcessed} processed, ${totalFound} websites found`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ YellowPages discovery failed:', error.message);
+    }
+
+    this.running = false;
+    return { processed: totalProcessed, found: totalFound };
+  }
+
+  async _lookupBusiness(sme) {
+    const name = encodeURIComponent(sme.business_name);
+    const location = encodeURIComponent(`${sme.city || ''} ${sme.province || ''}`.trim());
+    if (!location || location === '%20') return null;
+
+    const url = `https://www.yellowpages.ca/search/si/1/${name}/${location}`;
+
+    try {
+      const response = await axios.get(url, {
+        timeout: 15000,
+        headers: { 'User-Agent': this.userAgent },
+        maxRedirects: 3,
+        validateStatus: (s) => s < 400,
+      });
+
+      const $ = cheerio.load(response.data);
+      const normalizedSearch = this._normalize(sme.business_name);
+
+      // Look through listing results
+      let bestMatch = null;
+      let bestScore = 0;
+
+      $('div.listing, div.listing__content, article.listing').each((_, el) => {
+        const nameEl = $(el).find('a.listing__name--link, h3.listing__name a, .listing__name a').first();
+        const listingName = nameEl.text().trim();
+        if (!listingName) return;
+
+        const score = this._fuzzyMatch(normalizedSearch, this._normalize(listingName));
+        if (score > bestScore && score >= 0.6) {
+          bestScore = score;
+          const websiteEl = $(el).find('a.listing__link--icon.website, a[data-analytics="website"], a[href*="redirect"]').first();
+          const phoneEl = $(el).find('a.listing__link--icon.phone, span.mlr__sub-text, .listing__phone a').first();
+
+          let website = null;
+          const href = websiteEl.attr('href') || '';
+          if (href && !href.includes('yellowpages.ca')) {
+            // Extract actual URL from redirect links
+            const urlMatch = href.match(/[?&]url=([^&]+)/) || href.match(/redirect[?/].*?url=([^&]+)/);
+            website = urlMatch ? decodeURIComponent(urlMatch[1]) : (href.startsWith('http') ? href : null);
+          }
+
+          const phone = phoneEl.text().trim().replace(/[^0-9()-\s+]/g, '') || null;
+
+          if (website) {
+            bestMatch = { website, phone };
+          }
+        }
+      });
+
+      return bestMatch;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  _normalize(name) {
+    return (name || '').toLowerCase()
+      .replace(/\b(inc|ltd|llc|llp|corp|corporation|limited|co|company)\b/gi, '')
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim();
+  }
+
+  _fuzzyMatch(a, b) {
+    if (a === b) return 1;
+    if (!a || !b) return 0;
+    const wordsA = a.split(/\s+/);
+    const wordsB = b.split(/\s+/);
+    let matches = 0;
+    for (const w of wordsA) {
+      if (w.length >= 2 && wordsB.some(wb => wb.includes(w) || w.includes(wb))) matches++;
+    }
+    return matches / Math.max(wordsA.length, 1);
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ('yellowpages_website', 'running') RETURNING id`);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, processed, found) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, completed_at=NOW() WHERE id=$1`, [jobId, processed, found]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// =====================================================
+// 🌐 411.CA BUSINESS DIRECTORY ENRICHER
+// =====================================================
+
+class Directory411Enricher {
+  constructor() {
+    this.batchLimit = 500;
+    this.delayMs = 5000;
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.running = false;
+  }
+
+  async enrich(dbClient) {
+    if (this.running) {
+      console.log('[411.ca] Already running, skipping');
+      return { processed: 0, found: 0 };
+    }
+    this.running = true;
+
+    console.log('🌐 Starting 411.ca website discovery...');
+    const jobId = await this._startJob(dbClient);
+    let totalProcessed = 0, totalFound = 0;
+
+    try {
+      // Get SMEs without a website, skip those already checked by YP
+      const smes = await dbClient.query(
+        `SELECT id, business_name, province, city
+         FROM scraped_smes
+         WHERE website IS NULL
+           AND business_name IS NOT NULL AND business_name != ''
+           AND (enrichment_phase IS NULL OR enrichment_phase IN ('pending', 'no_domain', 'yp_no_match'))
+         ORDER BY
+           GREATEST(COALESCE(score_accountants,0), COALESCE(score_lawyers,0), COALESCE(score_investing,0)) DESC NULLS LAST,
+           id ASC
+         LIMIT $1`,
+        [this.batchLimit]
+      );
+
+      console.log(`[411.ca] Found ${smes.rows.length} SMEs to look up`);
+
+      for (const sme of smes.rows) {
+        totalProcessed++;
+        try {
+          const result = await this._lookupBusiness(sme);
+          if (result && result.website) {
+            await dbClient.query(
+              `UPDATE scraped_smes SET website = $2, website_source = '411ca',
+               phone = COALESCE(phone, $3), enrichment_phase = 'website_found',
+               updated_at = NOW() WHERE id = $1`,
+              [sme.id, result.website, result.phone || null]
+            );
+            totalFound++;
+          } else {
+            await dbClient.query(
+              `UPDATE scraped_smes SET enrichment_phase = '411_no_match', updated_at = NOW()
+               WHERE id = $1 AND enrichment_phase != 'yp_no_match'`,
+              [sme.id]
+            );
+          }
+        } catch (err) {
+          console.error(`[411.ca] Error for ${sme.business_name}:`, err.message);
+        }
+
+        if (totalProcessed % 50 === 0) {
+          console.log(`[411.ca] Progress: ${totalProcessed}/${smes.rows.length}, found ${totalFound} websites`);
+        }
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalProcessed, totalFound);
+      console.log(`✅ 411.ca discovery: ${totalProcessed} processed, ${totalFound} websites found`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ 411.ca discovery failed:', error.message);
+    }
+
+    this.running = false;
+    return { processed: totalProcessed, found: totalFound };
+  }
+
+  async _lookupBusiness(sme) {
+    const name = encodeURIComponent(sme.business_name);
+    const location = encodeURIComponent(`${sme.city || ''} ${sme.province || ''}`.trim());
+    if (!location || location === '%20') return null;
+
+    const url = `https://411.ca/business/search/?q=${name}&l=${location}`;
+
+    try {
+      const response = await axios.get(url, {
+        timeout: 15000,
+        headers: { 'User-Agent': this.userAgent },
+        maxRedirects: 3,
+        validateStatus: (s) => s < 400,
+      });
+
+      const $ = cheerio.load(response.data);
+      const normalizedSearch = this._normalize(sme.business_name);
+
+      let bestMatch = null;
+      let bestScore = 0;
+
+      $('div.listing, div.result, .c411ListedName, .listing-card').each((_, el) => {
+        const nameEl = $(el).find('a.listing-name, h2 a, .c411ListedName a, .listing-card__name a').first();
+        const listingName = nameEl.text().trim();
+        if (!listingName) return;
+
+        const score = this._fuzzyMatch(normalizedSearch, this._normalize(listingName));
+        if (score > bestScore && score >= 0.6) {
+          bestScore = score;
+          const websiteEl = $(el).find('a[data-type="website"], a.listing-website, a[rel="nofollow"][href*="http"]').first();
+          const phoneEl = $(el).find('.c411Phone, .listing-phone, a[href^="tel:"]').first();
+
+          let website = websiteEl.attr('href') || null;
+          if (website && website.includes('411.ca')) website = null;
+
+          const phone = phoneEl.text().trim().replace(/[^0-9()-\s+]/g, '') || null;
+
+          if (website) {
+            bestMatch = { website, phone };
+          }
+        }
+      });
+
+      return bestMatch;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  _normalize(name) {
+    return (name || '').toLowerCase()
+      .replace(/\b(inc|ltd|llc|llp|corp|corporation|limited|co|company)\b/gi, '')
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim();
+  }
+
+  _fuzzyMatch(a, b) {
+    if (a === b) return 1;
+    if (!a || !b) return 0;
+    const wordsA = a.split(/\s+/);
+    const wordsB = b.split(/\s+/);
+    let matches = 0;
+    for (const w of wordsA) {
+      if (w.length >= 2 && wordsB.some(wb => wb.includes(w) || w.includes(wb))) matches++;
+    }
+    return matches / Math.max(wordsA.length, 1);
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ('411ca_website', 'running') RETURNING id`);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, processed, found) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, completed_at=NOW() WHERE id=$1`, [jobId, processed, found]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// =====================================================
+// 🏢 BBB.ORG PROFILE ENRICHER
+// =====================================================
+
+class BBBProfileEnricher {
+  constructor() {
+    this.batchLimit = 200;
+    this.delayMs = 5000;
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.running = false;
+  }
+
+  async enrich(dbClient) {
+    if (this.running) {
+      console.log('[BBB] Already running, skipping');
+      return { processed: 0, found: 0 };
+    }
+    this.running = true;
+
+    console.log('🏢 Starting BBB profile enrichment...');
+    const jobId = await this._startJob(dbClient);
+    let totalProcessed = 0, totalFound = 0;
+
+    try {
+      const smes = await dbClient.query(
+        `SELECT id, business_name, province, city
+         FROM scraped_smes
+         WHERE website IS NULL AND contact_email IS NULL
+           AND business_name IS NOT NULL AND business_name != ''
+           AND (enrichment_phase IS NULL OR enrichment_phase IN ('pending', 'no_domain', 'yp_no_match', '411_no_match'))
+         ORDER BY
+           GREATEST(COALESCE(score_accountants,0), COALESCE(score_lawyers,0), COALESCE(score_investing,0)) DESC NULLS LAST
+         LIMIT $1`,
+        [this.batchLimit]
+      );
+
+      console.log(`[BBB] Found ${smes.rows.length} SMEs to look up`);
+
+      for (const sme of smes.rows) {
+        totalProcessed++;
+        try {
+          const result = await this._lookupBusiness(sme);
+          if (result) {
+            const updates = [];
+            const params = [sme.id];
+            let idx = 2;
+
+            if (result.website) {
+              updates.push(`website = $${idx++}`);
+              params.push(result.website);
+              updates.push("website_source = 'bbb'");
+            }
+            if (result.email) {
+              updates.push(`contact_email = $${idx++}`);
+              params.push(result.email);
+              updates.push(`enrichment_source = 'bbb'`);
+              updates.push(`enrichment_date = NOW()`);
+            }
+            if (result.phone) {
+              updates.push(`phone = COALESCE(phone, $${idx++})`);
+              params.push(result.phone);
+            }
+            updates.push("enrichment_phase = 'bbb_found'");
+            updates.push('updated_at = NOW()');
+
+            if (result.email) updates.push("status = 'enriched'");
+
+            await dbClient.query(
+              `UPDATE scraped_smes SET ${updates.join(', ')} WHERE id = $1`,
+              params
+            );
+            totalFound++;
+          } else {
+            await dbClient.query(
+              `UPDATE scraped_smes SET enrichment_phase = 'bbb_no_match', updated_at = NOW() WHERE id = $1`,
+              [sme.id]
+            );
+          }
+        } catch (err) {
+          console.error(`[BBB] Error for ${sme.business_name}:`, err.message);
+        }
+
+        if (totalProcessed % 50 === 0) {
+          console.log(`[BBB] Progress: ${totalProcessed}/${smes.rows.length}, found ${totalFound}`);
+        }
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalProcessed, totalFound);
+      console.log(`✅ BBB enrichment: ${totalProcessed} processed, ${totalFound} found`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ BBB enrichment failed:', error.message);
+    }
+
+    this.running = false;
+    return { processed: totalProcessed, found: totalFound };
+  }
+
+  async _lookupBusiness(sme) {
+    // Map province to BBB region codes
+    const regionMap = {
+      'ON': 'ontario', 'BC': 'british-columbia', 'AB': 'alberta', 'QC': 'quebec',
+      'MB': 'manitoba', 'SK': 'saskatchewan', 'NS': 'nova-scotia', 'NB': 'new-brunswick',
+      'PE': 'prince-edward-island', 'NL': 'newfoundland-labrador',
+    };
+    const region = regionMap[sme.province] || 'canada';
+    const name = encodeURIComponent(sme.business_name);
+    const url = `https://www.bbb.org/search?find_text=${name}&find_loc=${encodeURIComponent(sme.city || sme.province || '')}&find_country=CAN&find_type=Category`;
+
+    try {
+      const response = await axios.get(url, {
+        timeout: 15000,
+        headers: { 'User-Agent': this.userAgent },
+        maxRedirects: 3,
+        validateStatus: (s) => s < 400,
+      });
+
+      const $ = cheerio.load(response.data);
+      const normalizedSearch = this._normalize(sme.business_name);
+
+      let bestMatch = null;
+      let bestScore = 0;
+
+      // BBB search results
+      $('a[data-bbb-link="business-name"], .result-name a, .bds-body a[href*="/profile/"]').each((_, el) => {
+        const listingName = $(el).text().trim();
+        if (!listingName) return;
+
+        const score = this._fuzzyMatch(normalizedSearch, this._normalize(listingName));
+        if (score > bestScore && score >= 0.65) {
+          bestScore = score;
+          const profileUrl = $(el).attr('href');
+          if (profileUrl) {
+            bestMatch = { profileUrl: profileUrl.startsWith('http') ? profileUrl : `https://www.bbb.org${profileUrl}` };
+          }
+        }
+      });
+
+      if (!bestMatch) return null;
+
+      // Fetch profile page for website/email/phone
+      await delay(2000);
+      const profileResp = await axios.get(bestMatch.profileUrl, {
+        timeout: 15000,
+        headers: { 'User-Agent': this.userAgent },
+        maxRedirects: 3,
+        validateStatus: (s) => s < 400,
+      });
+
+      const $p = cheerio.load(profileResp.data);
+      let website = null;
+      let email = null;
+      let phone = null;
+
+      // Website link
+      $p('a[href*="http"][data-bbb-link="business-website"], a.business-website, a[data-tracking="website"]').each((_, el) => {
+        const href = $p(el).attr('href');
+        if (href && !href.includes('bbb.org')) website = href;
+      });
+
+      // Phone
+      $p('a[href^="tel:"], .business-phone, .dtm-phone').each((_, el) => {
+        const ph = $p(el).text().trim().replace(/[^0-9()-\s+]/g, '');
+        if (ph.length >= 10) phone = ph;
+      });
+
+      // Email from page content
+      const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+      const pageText = $p('body').text();
+      const emails = pageText.match(emailRegex) || [];
+      for (const e of emails) {
+        if (!e.match(/@(bbb\.org|example\.|test\.|sentry\.)/i) && !e.match(/^(noreply|no-reply)@/i)) {
+          email = e.toLowerCase();
+          break;
+        }
+      }
+
+      if (website || email || phone) {
+        return { website, email, phone };
+      }
+      return null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  _normalize(name) {
+    return (name || '').toLowerCase()
+      .replace(/\b(inc|ltd|llc|llp|corp|corporation|limited|co|company)\b/gi, '')
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim();
+  }
+
+  _fuzzyMatch(a, b) {
+    if (a === b) return 1;
+    if (!a || !b) return 0;
+    const wordsA = a.split(/\s+/);
+    const wordsB = b.split(/\s+/);
+    let matches = 0;
+    for (const w of wordsA) {
+      if (w.length >= 2 && wordsB.some(wb => wb.includes(w) || w.includes(wb))) matches++;
+    }
+    return matches / Math.max(wordsA.length, 1);
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ('bbb_enrichment', 'running') RETURNING id`);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, processed, found) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, completed_at=NOW() WHERE id=$1`, [jobId, processed, found]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// =====================================================
+// 🏛️ CHAMBER OF COMMERCE DIRECTORY ENRICHER
+// =====================================================
+
+class ChamberDirectoryEnricher {
+  constructor() {
+    this.batchLimit = 200;
+    this.delayMs = 5000;
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    this.running = false;
+    // Major Canadian chambers with member directory URLs
+    this.chambers = [
+      { name: 'Toronto Board of Trade', baseUrl: 'https://www.bot.com', searchPath: '/member-directory/?q=', city: 'Toronto', province: 'ON' },
+      { name: 'Calgary Chamber', baseUrl: 'https://www.calgarychamber.com', searchPath: '/member-directory/?q=', city: 'Calgary', province: 'AB' },
+      { name: 'Ottawa Chamber', baseUrl: 'https://www.ottawachamber.ca', searchPath: '/member-directory/?q=', city: 'Ottawa', province: 'ON' },
+      { name: 'Vancouver Board of Trade', baseUrl: 'https://www.boardoftrade.com', searchPath: '/member-directory/?q=', city: 'Vancouver', province: 'BC' },
+    ];
+  }
+
+  async enrich(dbClient) {
+    if (this.running) {
+      console.log('[Chamber] Already running, skipping');
+      return { processed: 0, found: 0 };
+    }
+    this.running = true;
+
+    console.log('🏛️ Starting Chamber of Commerce enrichment...');
+    const jobId = await this._startJob(dbClient);
+    let totalProcessed = 0, totalFound = 0;
+
+    try {
+      for (const chamber of this.chambers) {
+        console.log(`[Chamber] Searching ${chamber.name}...`);
+
+        // Get SMEs in this city without website
+        const smes = await dbClient.query(
+          `SELECT id, business_name, province, city
+           FROM scraped_smes
+           WHERE website IS NULL AND contact_email IS NULL
+             AND business_name IS NOT NULL AND business_name != ''
+             AND LOWER(city) = LOWER($1) AND province = $2
+           ORDER BY GREATEST(COALESCE(score_accountants,0), COALESCE(score_lawyers,0), COALESCE(score_investing,0)) DESC
+           LIMIT $3`,
+          [chamber.city, chamber.province, Math.floor(this.batchLimit / this.chambers.length)]
+        );
+
+        for (const sme of smes.rows) {
+          totalProcessed++;
+          try {
+            const result = await this._searchChamber(chamber, sme);
+            if (result) {
+              const updates = ['updated_at = NOW()'];
+              const params = [sme.id];
+              let idx = 2;
+
+              if (result.website) {
+                updates.push(`website = $${idx++}`);
+                params.push(result.website);
+                updates.push("website_source = 'chamber'");
+                updates.push("enrichment_phase = 'chamber_found'");
+              }
+              if (result.email) {
+                updates.push(`contact_email = $${idx++}`);
+                params.push(result.email);
+                updates.push("enrichment_source = 'chamber'");
+                updates.push("enrichment_date = NOW()");
+                updates.push("status = 'enriched'");
+              }
+              if (result.phone) {
+                updates.push(`phone = COALESCE(phone, $${idx++})`);
+                params.push(result.phone);
+              }
+
+              await dbClient.query(`UPDATE scraped_smes SET ${updates.join(', ')} WHERE id = $1`, params);
+              totalFound++;
+            }
+          } catch (err) {
+            console.error(`[Chamber] Error for ${sme.business_name}:`, err.message);
+          }
+          await delay(this.delayMs);
+        }
+      }
+
+      await this._completeJob(dbClient, jobId, totalProcessed, totalFound);
+      console.log(`✅ Chamber enrichment: ${totalProcessed} processed, ${totalFound} found`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Chamber enrichment failed:', error.message);
+    }
+
+    this.running = false;
+    return { processed: totalProcessed, found: totalFound };
+  }
+
+  async _searchChamber(chamber, sme) {
+    const url = `${chamber.baseUrl}${chamber.searchPath}${encodeURIComponent(sme.business_name)}`;
+
+    try {
+      const response = await axios.get(url, {
+        timeout: 15000,
+        headers: { 'User-Agent': this.userAgent },
+        maxRedirects: 3,
+        validateStatus: (s) => s < 400,
+      });
+
+      const $ = cheerio.load(response.data);
+      const normalizedSearch = this._normalize(sme.business_name);
+
+      let website = null;
+      let email = null;
+      let phone = null;
+
+      // Generic selectors for chamber member directories
+      $('div.member, div.listing, article, .member-card, .directory-listing').each((_, el) => {
+        const nameEl = $(el).find('h2 a, h3 a, .member-name a, .listing-name a').first();
+        const listingName = nameEl.text().trim();
+        if (!listingName) return;
+
+        const score = this._fuzzyMatch(normalizedSearch, this._normalize(listingName));
+        if (score >= 0.65) {
+          // Look for website link
+          $(el).find('a[href*="http"]').each((_, linkEl) => {
+            const href = $(linkEl).attr('href') || '';
+            if (!href.includes(chamber.baseUrl) && !href.includes('facebook') && !href.includes('linkedin') && !href.includes('twitter')) {
+              if (!website) website = href;
+            }
+          });
+
+          // Look for phone
+          $(el).find('a[href^="tel:"], .phone, .member-phone').each((_, phoneEl) => {
+            const ph = $(phoneEl).text().trim().replace(/[^0-9()-\s+]/g, '');
+            if (ph.length >= 10 && !phone) phone = ph;
+          });
+
+          // Look for email
+          const text = $(el).text();
+          const emailMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+          if (emailMatch && !emailMatch[0].match(/@(example|test|sentry)\./i)) {
+            email = emailMatch[0].toLowerCase();
+          }
+        }
+      });
+
+      if (website || email) return { website, email, phone };
+      return null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  _normalize(name) {
+    return (name || '').toLowerCase()
+      .replace(/\b(inc|ltd|llc|llp|corp|corporation|limited|co|company)\b/gi, '')
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim();
+  }
+
+  _fuzzyMatch(a, b) {
+    if (a === b) return 1;
+    if (!a || !b) return 0;
+    const wordsA = a.split(/\s+/);
+    const wordsB = b.split(/\s+/);
+    let matches = 0;
+    for (const w of wordsA) {
+      if (w.length >= 2 && wordsB.some(wb => wb.includes(w) || w.includes(wb))) matches++;
+    }
+    return matches / Math.max(wordsA.length, 1);
+  }
+
+  async _startJob(dbClient) {
+    const r = await dbClient.query(`INSERT INTO scrape_jobs (source, status) VALUES ('chamber_enrichment', 'running') RETURNING id`);
+    return r.rows[0].id;
+  }
+  async _completeJob(dbClient, jobId, processed, found) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='completed', records_found=$2, records_inserted=$3, completed_at=NOW() WHERE id=$1`, [jobId, processed, found]);
+  }
+  async _failJob(dbClient, jobId, msg) {
+    await dbClient.query(`UPDATE scrape_jobs SET status='failed', error_message=$2, completed_at=NOW() WHERE id=$1`, [jobId, msg]);
+  }
+}
+
+// =====================================================
+// 🏛️ FEDERAL GRANTS & CONTRIBUTIONS LOADER
+// =====================================================
+
+class FederalGrantsLoader {
+  constructor() {
+    this.source = 'federal_grants';
+    this.userAgent = 'CanadaAccountants-DataCollection/1.0';
+    this.highValuePrograms = ['IRAP', 'SR&ED', 'SRED', 'BDC', 'CanExport', 'NRC', 'NSERC', 'CFI', 'MITACS', 'WAGE', 'FedDev', 'WD', 'ACOA', 'CED'];
+  }
+
+  async scrape(dbClient) {
+    console.log('🏛️ Starting Federal Grants & Contributions load...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      // Download the CSV from Open Canada
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=432527ab-7aac-45b5-81d6-7597107a7f8d', {
+        timeout: 30000,
+        headers: { 'User-Agent': this.userAgent },
+      });
+      const resources = metaResp.data?.result?.resources || [];
+      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
+      if (!csvResource) throw new Error('No CSV resource found in federal grants dataset');
+
+      console.log(`[FederalGrants] Downloading CSV from: ${csvResource.url}`);
+      const csvResp = await axios.get(csvResource.url, {
+        timeout: 600000,
+        headers: { 'User-Agent': this.userAgent },
+        maxContentLength: 500 * 1024 * 1024,
+      });
+
+      const lines = csvResp.data.split('\n');
+      if (lines.length < 2) throw new Error('Empty CSV');
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      const colIdx = {};
+      headers.forEach((h, i) => { colIdx[h] = i; });
+
+      const nameCol = colIdx['recipient_name'] ?? colIdx['recipient_legal_name'] ?? colIdx['owner_org'] ?? 0;
+      const provCol = colIdx['recipient_province'] ?? colIdx['recipient_prov'] ?? colIdx['province'];
+      const cityCol = colIdx['recipient_city'] ?? colIdx['city'];
+      const valueCol = colIdx['agreement_value'] ?? colIdx['total_funding'] ?? colIdx['amount'];
+      const programCol = colIdx['program_name'] ?? colIdx['program'] ?? colIdx['agreement_type'];
+
+      const batch = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        totalFound++;
+
+        const cols = this._parseCSVLine(line);
+        const name = (cols[nameCol] || '').trim();
+        if (!name || name.length < 3) continue;
+
+        const program = programCol !== undefined ? (cols[programCol] || '').trim() : '';
+        // Filter for high-value programs
+        const isHighValue = this.highValuePrograms.some(p => program.toUpperCase().includes(p));
+        if (!isHighValue && program) continue;
+
+        const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
+        const amount = valueCol !== undefined ? parseFloat((cols[valueCol] || '0').replace(/[^0-9.-]/g, '')) || null : null;
+
+        batch.push({ name, province, city: cityCol !== undefined ? (cols[cityCol] || '').trim() : '', amount, program });
+
+        if (batch.length >= 500) {
+          const r = await this._insertBatch(dbClient, batch, jobId);
+          totalInserted += r.inserted;
+          totalSkipped += r.skipped;
+          batch.length = 0;
+        }
+      }
+      if (batch.length > 0) {
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        totalInserted += r.inserted;
+        totalSkipped += r.skipped;
+      }
+
+      // Boost scores for grant recipients
+      try {
+        const boosted = await dbClient.query(`
+          UPDATE scraped_smes SET
+            score_accountants = GREATEST(COALESCE(score_accountants, 0), COALESCE(score_accountants, 0) + 15),
+            score_lawyers = GREATEST(COALESCE(score_lawyers, 0), COALESCE(score_lawyers, 0) + 15),
+            score_investing = GREATEST(COALESCE(score_investing, 0), COALESCE(score_investing, 0) + 15)
+          WHERE source = 'federal_grants' AND grant_amount IS NOT NULL AND grant_amount > 0
+        `);
+        console.log(`[FederalGrants] Score boost applied to ${boosted.rowCount} grant recipients`);
+      } catch (e) { console.error('[FederalGrants] Score boost failed:', e.message); }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Federal Grants: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Federal Grants load failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertBatch(dbClient, batch, jobId) {
+    let inserted = 0, skipped = 0;
+    for (const rec of batch) {
+      try {
+        const hash = nameProvinceHash(rec.name, rec.province);
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, province, city, grant_amount, grant_program, name_province_hash, scrape_job_id, business_type)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Grant Recipient')
+           ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL
+           DO UPDATE SET grant_amount = GREATEST(COALESCE(scraped_smes.grant_amount, 0), COALESCE(EXCLUDED.grant_amount, 0)),
+             grant_program = COALESCE(EXCLUDED.grant_program, scraped_smes.grant_program),
+             updated_at = NOW()`,
+          [this.source, rec.name, rec.province, rec.city, rec.amount, rec.program, hash, jobId]
+        );
+        inserted++;
+      } catch (err) { skipped++; }
+    }
+    return { inserted, skipped };
+  }
+
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 🏢 ORGBOOK BC API SCRAPER
+// =====================================================
+
+class OrgBookBCScraper {
+  constructor() {
+    this.source = 'orgbook_bc';
+    this.baseUrl = 'https://orgbook.gov.bc.ca/api/v4/search/topic';
+    this.batchSize = 100;
+    this.delayMs = 500;
+  }
+
+  async scrape(dbClient) {
+    console.log('🏢 Starting OrgBook BC scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      let start = 0;
+      let hasMore = true;
+
+      while (hasMore) {
+        const response = await axios.get(this.baseUrl, {
+          params: { q: '*', inactive: false, latest: true, rows: this.batchSize, start },
+          timeout: 30000,
+        });
+
+        const results = response.data?.results || [];
+        if (results.length === 0) { hasMore = false; break; }
+
+        for (const entity of results) {
+          totalFound++;
+          const name = entity.names?.[0]?.text || entity.topic?.source_id || '';
+          if (!name || name.length < 2) continue;
+
+          const sourceId = entity.topic?.source_id || '';
+          const hash = nameProvinceHash(name, 'BC');
+
+          try {
+            await dbClient.query(
+              `INSERT INTO scraped_smes (source, business_name, province, corporate_number, name_province_hash, scrape_job_id)
+               VALUES ($1, $2, 'BC', $3, $4, $5)
+               ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
+              [this.source, name, sourceId, hash, jobId]
+            );
+            totalInserted++;
+          } catch (err) { totalSkipped++; }
+        }
+
+        start += results.length;
+        if (start % 5000 === 0) {
+          console.log(`[OrgBookBC] Progress: ${start} fetched, ${totalInserted} new, ${totalSkipped} skipped`);
+        }
+
+        // Stop at a reasonable limit to avoid overwhelming the DB
+        if (start >= 500000) {
+          console.log('[OrgBookBC] Reached 500K cap, stopping');
+          hasMore = false;
+        }
+
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ OrgBook BC: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ OrgBook BC failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 🏛️ CRA CHARITIES T3010 LOADER
+// =====================================================
+
+class CRACharitiesLoader {
+  constructor() {
+    this.source = 'cra_charities';
+    this.userAgent = 'CanadaAccountants-DataCollection/1.0';
+  }
+
+  async scrape(dbClient) {
+    console.log('🏛️ Starting CRA Charities T3010 load...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=d79983b8-91f0-4bbd-a87d-2a9f50c7e3e4', {
+        timeout: 30000, headers: { 'User-Agent': this.userAgent },
+      });
+      const resources = metaResp.data?.result?.resources || [];
+      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
+      if (!csvResource) throw new Error('No CSV resource found in CRA Charities dataset');
+
+      console.log(`[CRACharities] Downloading CSV from: ${csvResource.url}`);
+      const csvResp = await axios.get(csvResource.url, {
+        timeout: 600000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 500 * 1024 * 1024,
+      });
+
+      const lines = csvResp.data.split('\n');
+      if (lines.length < 2) throw new Error('Empty CSV');
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      const colIdx = {};
+      headers.forEach((h, i) => { colIdx[h] = i; });
+
+      const nameCol = colIdx['charity_legal_name'] ?? colIdx['legal_name'] ?? colIdx['name'] ?? 0;
+      const bnCol = colIdx['bn'] ?? colIdx['business_number'] ?? colIdx['registration_number'];
+      const provCol = colIdx['province'] ?? colIdx['prov'];
+      const cityCol = colIdx['city'];
+
+      const batch = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        totalFound++;
+
+        const cols = this._parseCSVLine(line);
+        const name = (cols[nameCol] || '').trim();
+        if (!name || name.length < 3) continue;
+
+        const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
+        const bn = bnCol !== undefined ? (cols[bnCol] || '').trim() : '';
+
+        batch.push({ name, province, city: cityCol !== undefined ? (cols[cityCol] || '').trim() : '', bn });
+
+        if (batch.length >= 500) {
+          const r = await this._insertBatch(dbClient, batch, jobId);
+          totalInserted += r.inserted; totalSkipped += r.skipped;
+          batch.length = 0;
+          if (totalFound % 20000 === 0) console.log(`[CRACharities] Progress: ${totalFound} processed, ${totalInserted} new`);
+        }
+      }
+      if (batch.length > 0) {
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        totalInserted += r.inserted; totalSkipped += r.skipped;
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ CRA Charities: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ CRA Charities load failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertBatch(dbClient, batch, jobId) {
+    let inserted = 0, skipped = 0;
+    for (const rec of batch) {
+      try {
+        const hash = nameProvinceHash(rec.name, rec.province);
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, province, city, corporate_number, name_province_hash, scrape_job_id, business_type)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'Charity')
+           ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
+          [this.source, rec.name, rec.province, rec.city, rec.bn, hash, jobId]
+        );
+        inserted++;
+      } catch (err) { skipped++; }
+    }
+    return { inserted, skipped };
+  }
+
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 📦 CANADIAN IMPORTERS DATABASE LOADER
+// =====================================================
+
+class CanadianImportersLoader {
+  constructor() {
+    this.source = 'importers_canada';
+    this.userAgent = 'CanadaAccountants-DataCollection/1.0';
+  }
+
+  async scrape(dbClient) {
+    console.log('📦 Starting Canadian Importers load...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=4e2e5e56-0370-4804-90cf-6b2e35bcd20e', {
+        timeout: 30000, headers: { 'User-Agent': this.userAgent },
+      });
+      const resources = metaResp.data?.result?.resources || [];
+      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
+      if (!csvResource) throw new Error('No CSV resource found in importers dataset');
+
+      console.log(`[Importers] Downloading CSV from: ${csvResource.url}`);
+      const csvResp = await axios.get(csvResource.url, {
+        timeout: 600000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 500 * 1024 * 1024,
+      });
+
+      const lines = csvResp.data.split('\n');
+      if (lines.length < 2) throw new Error('Empty CSV');
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      const colIdx = {};
+      headers.forEach((h, i) => { colIdx[h] = i; });
+
+      const nameCol = colIdx['importer_name'] ?? colIdx['name'] ?? colIdx['business_name'] ?? 0;
+      const provCol = colIdx['province'] ?? colIdx['prov'];
+      const cityCol = colIdx['city'];
+
+      const batch = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        totalFound++;
+
+        const cols = this._parseCSVLine(line);
+        const name = (cols[nameCol] || '').trim();
+        if (!name || name.length < 3) continue;
+
+        const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
+
+        batch.push({ name, province, city: cityCol !== undefined ? (cols[cityCol] || '').trim() : '' });
+
+        if (batch.length >= 500) {
+          const r = await this._insertBatch(dbClient, batch, jobId);
+          totalInserted += r.inserted; totalSkipped += r.skipped;
+          batch.length = 0;
+          if (totalFound % 10000 === 0) console.log(`[Importers] Progress: ${totalFound} processed, ${totalInserted} new`);
+        }
+      }
+      if (batch.length > 0) {
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        totalInserted += r.inserted; totalSkipped += r.skipped;
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Importers: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Importers load failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertBatch(dbClient, batch, jobId) {
+    let inserted = 0, skipped = 0;
+    for (const rec of batch) {
+      try {
+        const hash = nameProvinceHash(rec.name, rec.province);
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, province, city, name_province_hash, scrape_job_id, business_type)
+           VALUES ($1, $2, $3, $4, $5, $6, 'Importer')
+           ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
+          [this.source, rec.name, rec.province, rec.city, hash, jobId]
+        );
+        inserted++;
+      } catch (err) { skipped++; }
+    }
+    return { inserted, skipped };
+  }
+
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 🏙️ OTTAWA BUSINESS LICENCES (ArcGIS)
+// =====================================================
+
+class OttawaBizLicScraper {
+  constructor() {
+    this.source = 'ottawa_biz_lic';
+    this.baseUrl = 'https://maps.ottawa.ca/arcgis/rest/services/Economy/Business_Licences/MapServer/0/query';
+    this.delayMs = 500;
+  }
+
+  async scrape(dbClient) {
+    console.log('🏙️ Starting Ottawa Business Licences scrape...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      let offset = 0;
+      let hasMore = true;
+
+      while (hasMore) {
+        const response = await axios.get(this.baseUrl, {
+          params: {
+            where: '1=1',
+            outFields: '*',
+            f: 'json',
+            resultOffset: offset,
+            resultRecordCount: 1000,
+          },
+          timeout: 30000,
+        });
+
+        const features = response.data?.features || [];
+        if (features.length === 0) { hasMore = false; break; }
+
+        for (const feature of features) {
+          totalFound++;
+          const attrs = feature.attributes || {};
+          const name = (attrs.BUSINESS_NAME || attrs.TRADE_NAME || attrs.NAME || '').trim();
+          if (!name || name.length < 2) continue;
+
+          const hash = nameProvinceHash(name, 'ON');
+          try {
+            await dbClient.query(
+              `INSERT INTO scraped_smes (source, business_name, province, city, full_address, name_province_hash, scrape_job_id, industry)
+               VALUES ($1, $2, 'ON', 'Ottawa', $3, $4, $5, $6)
+               ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
+              [this.source, name, attrs.ADDRESS || attrs.WARD || '', hash, jobId, attrs.LICENCE_TYPE || attrs.CATEGORY || '']
+            );
+            totalInserted++;
+          } catch (err) { totalSkipped++; }
+        }
+
+        offset += features.length;
+        if (offset % 5000 === 0) console.log(`[OttawaBizLic] Progress: ${offset} fetched, ${totalInserted} new`);
+        await delay(this.delayMs);
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Ottawa Biz Lic: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Ottawa Biz Lic failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// ™️ CIPO TRADEMARK FILINGS LOADER
+// =====================================================
+
+class CIPOTrademarkLoader {
+  constructor() {
+    this.source = 'cipo_trademarks';
+    this.userAgent = 'CanadaAccountants-DataCollection/1.0';
+  }
+
+  async scrape(dbClient) {
+    console.log('™️ Starting CIPO Trademark Filings load...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=fe09c9a8-3c3e-4ce9-8412-a5c03ebae8ea', {
+        timeout: 30000, headers: { 'User-Agent': this.userAgent },
+      });
+      const resources = metaResp.data?.result?.resources || [];
+      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
+      if (!csvResource) throw new Error('No CSV resource found in CIPO trademarks dataset');
+
+      console.log(`[CIPOTrademarks] Downloading CSV from: ${csvResource.url}`);
+      const csvResp = await axios.get(csvResource.url, {
+        timeout: 600000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 500 * 1024 * 1024,
+      });
+
+      const lines = csvResp.data.split('\n');
+      if (lines.length < 2) throw new Error('Empty CSV');
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      const colIdx = {};
+      headers.forEach((h, i) => { colIdx[h] = i; });
+
+      const nameCol = colIdx['applicant_name'] ?? colIdx['owner_name'] ?? colIdx['name'] ?? 0;
+      const provCol = colIdx['applicant_province'] ?? colIdx['province'] ?? colIdx['prov'];
+      const dateCol = colIdx['filing_date'] ?? colIdx['application_date'] ?? colIdx['date'];
+
+      // Only keep filings from the last 2 years
+      const twoYearsAgo = new Date();
+      twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+
+      const batch = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        totalFound++;
+
+        const cols = this._parseCSVLine(line);
+        const name = (cols[nameCol] || '').trim();
+        if (!name || name.length < 3) continue;
+
+        // Filter for recent filings only
+        if (dateCol !== undefined) {
+          const filingDate = new Date(cols[dateCol] || '');
+          if (!isNaN(filingDate.getTime()) && filingDate < twoYearsAgo) continue;
+        }
+
+        const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
+
+        batch.push({ name, province });
+
+        if (batch.length >= 500) {
+          const r = await this._insertBatch(dbClient, batch, jobId);
+          totalInserted += r.inserted; totalSkipped += r.skipped;
+          batch.length = 0;
+          if (totalFound % 20000 === 0) console.log(`[CIPOTrademarks] Progress: ${totalFound} processed, ${totalInserted} new`);
+        }
+      }
+      if (batch.length > 0) {
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        totalInserted += r.inserted; totalSkipped += r.skipped;
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ CIPO Trademarks: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ CIPO Trademarks load failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertBatch(dbClient, batch, jobId) {
+    let inserted = 0, skipped = 0;
+    for (const rec of batch) {
+      try {
+        const hash = nameProvinceHash(rec.name, rec.province);
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, province, name_province_hash, scrape_job_id, business_type)
+           VALUES ($1, $2, $3, $4, $5, 'Trademark Filer')
+           ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
+          [this.source, rec.name, rec.province, hash, jobId]
+        );
+        inserted++;
+      } catch (err) { skipped++; }
+    }
+    return { inserted, skipped };
+  }
+
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
+// =====================================================
+// 🏛️ LOBBYIST REGISTRY LOADER
+// =====================================================
+
+class LobbyistRegistryLoader {
+  constructor() {
+    this.source = 'lobbyist_registry';
+    this.userAgent = 'CanadaAccountants-DataCollection/1.0';
+  }
+
+  async scrape(dbClient) {
+    console.log('🏛️ Starting Lobbyist Registry load...');
+    const jobId = await this._startJob(dbClient);
+    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
+
+    try {
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=7ec4e2fc-a90e-4eea-863a-3b8d3c3f1069', {
+        timeout: 30000, headers: { 'User-Agent': this.userAgent },
+      });
+      const resources = metaResp.data?.result?.resources || [];
+      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
+      if (!csvResource) throw new Error('No CSV resource found in lobbyist registry dataset');
+
+      console.log(`[LobbyistRegistry] Downloading CSV from: ${csvResource.url}`);
+      const csvResp = await axios.get(csvResource.url, {
+        timeout: 300000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 200 * 1024 * 1024,
+      });
+
+      const lines = csvResp.data.split('\n');
+      if (lines.length < 2) throw new Error('Empty CSV');
+
+      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+      const colIdx = {};
+      headers.forEach((h, i) => { colIdx[h] = i; });
+
+      const nameCol = colIdx['organization_name'] ?? colIdx['client'] ?? colIdx['employer'] ?? colIdx['corporation'] ?? 0;
+      const provCol = colIdx['province'] ?? colIdx['prov'];
+
+      const seen = new Set();
+      const batch = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        totalFound++;
+
+        const cols = this._parseCSVLine(line);
+        const name = (cols[nameCol] || '').trim();
+        if (!name || name.length < 3) continue;
+
+        // Deduplicate within this load
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
+
+        batch.push({ name, province });
+
+        if (batch.length >= 500) {
+          const r = await this._insertBatch(dbClient, batch, jobId);
+          totalInserted += r.inserted; totalSkipped += r.skipped;
+          batch.length = 0;
+        }
+      }
+      if (batch.length > 0) {
+        const r = await this._insertBatch(dbClient, batch, jobId);
+        totalInserted += r.inserted; totalSkipped += r.skipped;
+      }
+
+      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
+      console.log(`✅ Lobbyist Registry: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
+    } catch (error) {
+      await this._failJob(dbClient, jobId, error.message);
+      console.error('❌ Lobbyist Registry load failed:', error.message);
+    }
+    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+  }
+
+  async _insertBatch(dbClient, batch, jobId) {
+    let inserted = 0, skipped = 0;
+    for (const rec of batch) {
+      try {
+        const hash = nameProvinceHash(rec.name, rec.province);
+        await dbClient.query(
+          `INSERT INTO scraped_smes (source, business_name, province, name_province_hash, scrape_job_id, business_type)
+           VALUES ($1, $2, $3, $4, $5, 'Lobbying Organization')
+           ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
+          [this.source, rec.name, rec.province, hash, jobId]
+        );
+        inserted++;
+      } catch (err) { skipped++; }
+    }
+    return { inserted, skipped };
+  }
+
+  _parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  }
+
+  async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
+  async _completeJob(dbClient, jobId, found, inserted, skipped) { await dbClient.query(`UPDATE scrape_jobs SET status='completed',records_found=$2,records_inserted=$3,records_skipped=$4,completed_at=NOW() WHERE id=$1`, [jobId,found,inserted,skipped]); }
+  async _failJob(dbClient, jobId, msg) { await dbClient.query(`UPDATE scrape_jobs SET status='failed',error_message=$2,completed_at=NOW() WHERE id=$1`, [jobId,msg]); }
+}
+
 // Initialize scraper instances
 const cpaScraperOrchestrator = new CPAScraperOrchestrator();
-const corporationsCanadaAPI = new CorporationsCanadaAPI();
+const corporationsCanadaAPI = new CorporationsCanadaBulkLoader();
 const statCanODBusLoader = new StatCanODBusLoader();
+const vancouverBizLicScraper = new VancouverBizLicScraper();
+const calgaryBizLicScraper = new CalgaryBizLicScraper();
+const torontoBizLicScraper = new TorontoBizLicScraper();
+const edmontonBizLicScraper = new EdmontonBizLicScraper();
+const businessPriorityScorer = new BusinessPriorityScorer();
 const firmWebsiteEnricher = new FirmWebsiteEnricher();
 const smeEmailEnricher = new SMEEmailEnricher();
+const yellowPagesEnricher = new YellowPagesWebsiteEnricher();
+const directory411Enricher = new Directory411Enricher();
+const bbbProfileEnricher = new BBBProfileEnricher();
+const chamberDirectoryEnricher = new ChamberDirectoryEnricher();
+const federalGrantsLoader = new FederalGrantsLoader();
+const orgBookBCScraper = new OrgBookBCScraper();
+const craCharitiesLoader = new CRACharitiesLoader();
+const canadianImportersLoader = new CanadianImportersLoader();
+const ottawaBizLicScraper = new OttawaBizLicScraper();
+const cipoTrademarkLoader = new CIPOTrademarkLoader();
+const lobbyistRegistryLoader = new LobbyistRegistryLoader();
 
 // 🔄 DATA COLLECTION ORCHESTRATOR
 class DataCollectionOrchestrator {
@@ -4440,6 +7094,36 @@ cron.schedule('0 4 1 1,4,7,10 *', async () => {
     }
 });
 
+// 🏙️ VANCOUVER BIZ LICENCES — Weekly Sunday 6 AM
+cron.schedule('0 6 * * 0', async () => {
+    console.log('⏰ Starting weekly Vancouver business licence scrape...');
+    try { await vancouverBizLicScraper.scrape(dbClient); } catch (error) { console.error('❌ Vancouver biz lic failed:', error.message); }
+});
+
+// 🏙️ TORONTO BIZ LICENCES — Weekly Sunday 7 AM
+cron.schedule('0 7 * * 0', async () => {
+    console.log('⏰ Starting weekly Toronto business licence scrape...');
+    try { await torontoBizLicScraper.scrape(dbClient); } catch (error) { console.error('❌ Toronto biz lic failed:', error.message); }
+});
+
+// 🏙️ CALGARY BIZ LICENCES — Weekly Sunday 8 AM
+cron.schedule('0 8 * * 0', async () => {
+    console.log('⏰ Starting weekly Calgary business licence scrape...');
+    try { await calgaryBizLicScraper.scrape(dbClient); } catch (error) { console.error('❌ Calgary biz lic failed:', error.message); }
+});
+
+// 🏙️ EDMONTON BIZ LICENCES — Weekly Sunday 9 AM
+cron.schedule('0 9 * * 0', async () => {
+    console.log('⏰ Starting weekly Edmonton business licence scrape...');
+    try { await edmontonBizLicScraper.scrape(dbClient); } catch (error) { console.error('❌ Edmonton biz lic failed:', error.message); }
+});
+
+// 📊 BUSINESS PRIORITY SCORING — Daily at 3 AM
+cron.schedule('0 3 * * *', async () => {
+    console.log('⏰ Starting daily business priority scoring...');
+    try { await businessPriorityScorer.score(dbClient); } catch (error) { console.error('❌ Priority scoring failed:', error.message); }
+});
+
 // 📧 CPA EMAIL ENRICHMENT — Daily at 4 AM
 cron.schedule('0 4 * * *', async () => {
     console.log('⏰ Starting daily CPA email enrichment...');
@@ -4460,14 +7144,316 @@ cron.schedule('0 12 * * *', async () => {
     }
 });
 
-// 📧 SME EMAIL ENRICHMENT — Daily at 5 AM
+// 🌐 YELLOWPAGES WEBSITE DISCOVERY — Daily at 1 AM + 9 PM
+cron.schedule('0 1 * * *', async () => {
+    console.log('⏰ Starting YellowPages website discovery (run 1)...');
+    try { await yellowPagesEnricher.enrich(dbClient); } catch (error) { console.error('❌ YellowPages run 1 failed:', error.message); }
+});
+cron.schedule('0 21 * * *', async () => {
+    console.log('⏰ Starting YellowPages website discovery (run 2)...');
+    try { await yellowPagesEnricher.enrich(dbClient); } catch (error) { console.error('❌ YellowPages run 2 failed:', error.message); }
+});
+
+// 📧 SME EMAIL ENRICHMENT — 4 runs/day: 2 AM, 8 AM, 2 PM, 8 PM
+cron.schedule('0 2 * * *', async () => {
+    console.log('⏰ Starting SME email enrichment (run 1/4)...');
+    try { await smeEmailEnricher.enrich(dbClient); } catch (error) { console.error('❌ SME enrichment run 1 failed:', error.message); }
+});
+cron.schedule('0 8 * * *', async () => {
+    console.log('⏰ Starting SME email enrichment (run 2/4)...');
+    try { await smeEmailEnricher.enrich(dbClient); } catch (error) { console.error('❌ SME enrichment run 2 failed:', error.message); }
+});
+cron.schedule('0 14 * * *', async () => {
+    console.log('⏰ Starting SME email enrichment (run 3/4)...');
+    try { await smeEmailEnricher.enrich(dbClient); } catch (error) { console.error('❌ SME enrichment run 3 failed:', error.message); }
+});
+cron.schedule('0 20 * * *', async () => {
+    console.log('⏰ Starting SME email enrichment (run 4/4)...');
+    try { await smeEmailEnricher.enrich(dbClient); } catch (error) { console.error('❌ SME enrichment run 4 failed:', error.message); }
+});
+
+// 🌐 411.CA WEBSITE DISCOVERY — Daily at 3 AM + 11 PM (after 411 slot doesn't collide with priority scoring)
+cron.schedule('30 3 * * *', async () => {
+    console.log('⏰ Starting 411.ca website discovery (run 1)...');
+    try { await directory411Enricher.enrich(dbClient); } catch (error) { console.error('❌ 411.ca run 1 failed:', error.message); }
+});
+cron.schedule('0 23 * * *', async () => {
+    console.log('⏰ Starting 411.ca website discovery (run 2)...');
+    try { await directory411Enricher.enrich(dbClient); } catch (error) { console.error('❌ 411.ca run 2 failed:', error.message); }
+});
+
+// 🏢 BBB PROFILE ENRICHMENT — Daily at 5 AM
 cron.schedule('0 5 * * *', async () => {
-    console.log('⏰ Starting daily SME email enrichment...');
+    console.log('⏰ Starting BBB profile enrichment...');
+    try { await bbbProfileEnricher.enrich(dbClient); } catch (error) { console.error('❌ BBB enrichment failed:', error.message); }
+});
+
+// 🏛️ CHAMBER OF COMMERCE — Weekly Wednesday 6 PM
+cron.schedule('0 18 * * 3', async () => {
+    console.log('⏰ Starting Chamber of Commerce enrichment...');
+    try { await chamberDirectoryEnricher.enrich(dbClient); } catch (error) { console.error('❌ Chamber enrichment failed:', error.message); }
+});
+
+// 🔄 CPA ENRICHMENT RETRY — Daily at 6 AM UTC: reset attempted records for re-processing
+cron.schedule('0 6 * * *', async () => {
+    console.log('[Enrichment] Resetting CPA enrichment_attempted records for retry...');
     try {
-        await smeEmailEnricher.enrich(dbClient);
-    } catch (error) {
-        console.error('❌ Daily SME enrichment failed:', error.message);
+        const result = await dbClient.query(
+            `UPDATE scraped_cpas SET status = 'raw', updated_at = NOW()
+             WHERE id IN (
+               SELECT id FROM scraped_cpas
+               WHERE status = 'enrichment_attempted' AND updated_at < NOW() - INTERVAL '7 days'
+               LIMIT 500
+             )`
+        );
+        console.log(`[Enrichment] Reset ${result.rowCount} CPA attempted records for retry`);
+    } catch (err) {
+        console.error('[Enrichment] CPA retry reset error:', err.message);
     }
+});
+
+// 🔄 SME ENRICHMENT RETRY — Weekly Sunday 10 AM: reset old attempts for re-processing
+cron.schedule('0 10 * * 0', async () => {
+    console.log('[Enrichment] Resetting SME enrichment_attempted records for retry...');
+    try {
+        const result = await dbClient.query(
+            `UPDATE scraped_smes SET status = 'raw', enrichment_phase = 'pending', updated_at = NOW()
+             WHERE id IN (
+               SELECT id FROM scraped_smes
+               WHERE status = 'enrichment_attempted'
+                 AND updated_at < NOW() - INTERVAL '14 days'
+                 AND (enrichment_attempts IS NULL OR enrichment_attempts < 3)
+               LIMIT 5000
+             )`
+        );
+        console.log(`[Enrichment] Reset ${result.rowCount} SME attempted records for retry`);
+    } catch (err) {
+        console.error('[Enrichment] SME retry reset error:', err.message);
+    }
+});
+
+// 🏛️ FEDERAL GRANTS — Monthly, 1st at 5 AM UTC
+cron.schedule('0 5 1 * *', async () => {
+    console.log('⏰ Starting monthly Federal Grants load...');
+    try { await federalGrantsLoader.scrape(dbClient); } catch (e) { console.error('❌ Federal Grants cron failed:', e.message); }
+});
+
+// 🏢 ORGBOOK BC — Monthly, 2nd at 3 AM UTC
+cron.schedule('0 3 2 * *', async () => {
+    console.log('⏰ Starting monthly OrgBook BC scrape...');
+    try { await orgBookBCScraper.scrape(dbClient); } catch (e) { console.error('❌ OrgBook BC cron failed:', e.message); }
+});
+
+// 🏛️ CRA CHARITIES — Quarterly (Jan/Apr/Jul/Oct 15th)
+cron.schedule('0 4 15 1,4,7,10 *', async () => {
+    console.log('⏰ Starting quarterly CRA Charities load...');
+    try { await craCharitiesLoader.scrape(dbClient); } catch (e) { console.error('❌ CRA Charities cron failed:', e.message); }
+});
+
+// 📦 CANADIAN IMPORTERS — Monthly, 1st at 6 AM UTC
+cron.schedule('0 6 1 * *', async () => {
+    console.log('⏰ Starting monthly Canadian Importers load...');
+    try { await canadianImportersLoader.scrape(dbClient); } catch (e) { console.error('❌ Importers cron failed:', e.message); }
+});
+
+// 🏙️ OTTAWA BIZ LIC — Weekly Sunday 10 AM UTC
+cron.schedule('0 10 * * 0', async () => {
+    console.log('⏰ Starting weekly Ottawa Business Licences scrape...');
+    try { await ottawaBizLicScraper.scrape(dbClient); } catch (e) { console.error('❌ Ottawa Biz Lic cron failed:', e.message); }
+});
+
+// ™️ CIPO TRADEMARKS — Quarterly (Feb/May/Aug/Nov 1st)
+cron.schedule('0 5 1 2,5,8,11 *', async () => {
+    console.log('⏰ Starting quarterly CIPO Trademarks load...');
+    try { await cipoTrademarkLoader.scrape(dbClient); } catch (e) { console.error('❌ CIPO Trademarks cron failed:', e.message); }
+});
+
+// 🏛️ LOBBYIST REGISTRY — Quarterly (Mar/Jun/Sep/Dec 1st)
+cron.schedule('0 5 1 3,6,9,12 *', async () => {
+    console.log('⏰ Starting quarterly Lobbyist Registry load...');
+    try { await lobbyistRegistryLoader.scrape(dbClient); } catch (e) { console.error('❌ Lobbyist Registry cron failed:', e.message); }
+});
+
+// =====================================================
+// 📊 ENRICHMENT DIGEST EMAIL
+// =====================================================
+
+let lastDigestStats = null;
+
+async function sendEnrichmentDigest(dbClient) {
+    console.log('[Digest] Compiling enrichment pipeline report...');
+    const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'arthur@negotiateandwin.com';
+
+    // 1. Overall totals
+    const totals = await dbClient.query(`
+        SELECT
+            COUNT(*) AS total,
+            COUNT(CASE WHEN contact_email IS NOT NULL THEN 1 END) AS with_email,
+            COUNT(CASE WHEN website IS NOT NULL THEN 1 END) AS with_website,
+            COUNT(CASE WHEN email_verified = true THEN 1 END) AS verified_emails
+        FROM scraped_smes
+    `);
+    const t = totals.rows[0];
+
+    // 2. Phase breakdown
+    const phases = await dbClient.query(`
+        SELECT enrichment_phase, COUNT(*) AS cnt
+        FROM scraped_smes
+        GROUP BY enrichment_phase
+        ORDER BY cnt DESC
+    `);
+
+    // 3. Recent enrichment jobs (last 6 hours)
+    const recentJobs = await dbClient.query(`
+        SELECT source, status, records_found, records_inserted, records_skipped,
+               started_at, completed_at, error_message
+        FROM scrape_jobs
+        WHERE started_at >= NOW() - INTERVAL '6 hours'
+          AND (source ILIKE '%enrichment%' OR source ILIKE '%email%' OR source ILIKE '%website%'
+               OR source ILIKE '%yellowpages%' OR source ILIKE '%411%' OR source ILIKE '%bbb%'
+               OR source ILIKE '%chamber%')
+        ORDER BY started_at DESC
+        LIMIT 20
+    `);
+
+    // 4. Compute deltas
+    const currentStats = {
+        total: parseInt(t.total),
+        with_email: parseInt(t.with_email),
+        with_website: parseInt(t.with_website),
+        verified: parseInt(t.verified_emails)
+    };
+
+    let deltas = null;
+    if (lastDigestStats) {
+        deltas = {
+            total: currentStats.total - lastDigestStats.total,
+            with_email: currentStats.with_email - lastDigestStats.with_email,
+            with_website: currentStats.with_website - lastDigestStats.with_website,
+            verified: currentStats.verified - lastDigestStats.verified
+        };
+    }
+    lastDigestStats = { ...currentStats };
+
+    const coverage = currentStats.total > 0
+        ? ((currentStats.with_email / currentStats.total) * 100).toFixed(1)
+        : '0.0';
+
+    // 5. Build HTML
+    const deltaStr = (val) => {
+        if (val === null || val === undefined) return '';
+        if (val > 0) return `<span style="color:#059669;font-size:12px;"> +${val.toLocaleString()}</span>`;
+        if (val < 0) return `<span style="color:#ef4444;font-size:12px;"> ${val.toLocaleString()}</span>`;
+        return '<span style="color:#888;font-size:12px;"> +0</span>';
+    };
+
+    const now = new Date().toLocaleString('en-CA', { timeZone: 'America/Toronto' });
+
+    const phaseRows = phases.rows.map(r => `
+        <tr>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;font-family:monospace;">${r.enrichment_phase || 'null'}</td>
+            <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${parseInt(r.cnt).toLocaleString()}</td>
+        </tr>
+    `).join('');
+
+    const jobRows = recentJobs.rows.length > 0
+        ? recentJobs.rows.map(j => {
+            const statusColor = j.status === 'completed' ? '#059669' : j.status === 'failed' ? '#ef4444' : '#f59e0b';
+            const started = new Date(j.started_at).toLocaleString('en-CA', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit' });
+            return `
+                <tr>
+                    <td style="padding:8px 12px;border-bottom:1px solid #eee;">${j.source}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #eee;color:${statusColor};font-weight:600;">${j.status}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${(j.records_found || 0).toLocaleString()}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${(j.records_inserted || 0).toLocaleString()}</td>
+                    <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">${started}</td>
+                </tr>
+            `;
+        }).join('')
+        : '<tr><td colspan="5" style="padding:12px;text-align:center;color:#888;">No enrichment jobs in the last 6 hours</td></tr>';
+
+    const html = `
+    <div style="max-width:640px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#1a1a1a;">
+        <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:24px 32px;border-radius:8px 8px 0 0;">
+            <h1 style="margin:0;color:#fff;font-size:20px;">Enrichment Pipeline Report</h1>
+            <p style="margin:4px 0 0;color:rgba(255,255,255,0.8);font-size:13px;">${now} ET</p>
+        </div>
+
+        <div style="background:#fff;padding:24px 32px;border:1px solid #e5e7eb;">
+            <table style="width:100%;border-collapse:collapse;">
+                <tr>
+                    <td style="padding:12px;text-align:center;width:25%;">
+                        <div style="font-size:24px;font-weight:700;color:#667eea;">${currentStats.with_email.toLocaleString()}</div>
+                        <div style="font-size:12px;color:#666;margin-top:2px;">Emails Found</div>
+                        <div>${deltaStr(deltas?.with_email)}</div>
+                    </td>
+                    <td style="padding:12px;text-align:center;width:25%;">
+                        <div style="font-size:24px;font-weight:700;color:#764ba2;">${currentStats.with_website.toLocaleString()}</div>
+                        <div style="font-size:12px;color:#666;margin-top:2px;">Websites Found</div>
+                        <div>${deltaStr(deltas?.with_website)}</div>
+                    </td>
+                    <td style="padding:12px;text-align:center;width:25%;">
+                        <div style="font-size:24px;font-weight:700;color:#059669;">${currentStats.verified.toLocaleString()}</div>
+                        <div style="font-size:12px;color:#666;margin-top:2px;">Verified</div>
+                        <div>${deltaStr(deltas?.verified)}</div>
+                    </td>
+                    <td style="padding:12px;text-align:center;width:25%;">
+                        <div style="font-size:24px;font-weight:700;color:#f59e0b;">${coverage}%</div>
+                        <div style="font-size:12px;color:#666;margin-top:2px;">Coverage</div>
+                    </td>
+                </tr>
+            </table>
+            <div style="text-align:center;font-size:12px;color:#888;margin-top:4px;">Total SMEs: ${currentStats.total.toLocaleString()}${deltaStr(deltas?.total)}</div>
+        </div>
+
+        <div style="background:#fff;padding:24px 32px;border:1px solid #e5e7eb;border-top:none;">
+            <h3 style="margin:0 0 12px;font-size:14px;color:#333;">Recent Jobs (Last 6h)</h3>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead>
+                    <tr style="background:#f9fafb;">
+                        <th style="padding:8px 12px;text-align:left;font-weight:600;border-bottom:2px solid #e5e7eb;">Source</th>
+                        <th style="padding:8px 12px;text-align:left;font-weight:600;border-bottom:2px solid #e5e7eb;">Status</th>
+                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Found</th>
+                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Inserted</th>
+                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Time</th>
+                    </tr>
+                </thead>
+                <tbody>${jobRows}</tbody>
+            </table>
+        </div>
+
+        <div style="background:#fff;padding:24px 32px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;">
+            <h3 style="margin:0 0 12px;font-size:14px;color:#333;">Pipeline Phase Breakdown</h3>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead>
+                    <tr style="background:#f9fafb;">
+                        <th style="padding:8px 12px;text-align:left;font-weight:600;border-bottom:2px solid #e5e7eb;">Phase</th>
+                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Count</th>
+                    </tr>
+                </thead>
+                <tbody>${phaseRows}</tbody>
+            </table>
+        </div>
+
+        <p style="text-align:center;font-size:11px;color:#999;margin-top:16px;">
+            Automated report from sme-intelligence-backend &middot; Next report in 6 hours
+        </p>
+    </div>
+    `;
+
+    const result = await sendEmail({
+        to: ADMIN_EMAIL,
+        subject: `Enrichment Report — ${currentStats.with_email.toLocaleString()} emails (${coverage}% coverage) — ${now}`,
+        html
+    });
+
+    console.log(`[Digest] Report sent to ${ADMIN_EMAIL}: success=${result.success}`);
+    return result;
+}
+
+// 📊 ENRICHMENT DIGEST — Every 6 hours
+cron.schedule('0 0,6,12,18 * * *', async () => {
+    try { await sendEnrichmentDigest(dbClient); } catch (e) { console.error('[Digest] Failed:', e.message); }
 });
 
 // =====================================================
@@ -4521,7 +7507,11 @@ app.post('/api/scrape/rescrape/:source', async (req, res) => {
 // POST /api/scrape/trigger/:source — manually trigger a scrape (admin only)
 app.post('/api/scrape/trigger/:source', async (req, res) => {
     const { source } = req.params;
-    const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl', 'corporations_canada', 'statcan_odbus', 'email_enrichment', 'sme_email_enrichment', 'all_cpas'];
+    const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl',
+        'corporations_canada', 'statcan_odbus', 'email_enrichment', 'sme_email_enrichment', 'all_cpas',
+        'vancouver_biz_lic', 'calgary_biz_lic', 'toronto_biz_lic', 'edmonton_biz_lic', 'priority_scoring', 'all_municipal',
+        'yellowpages_website', '411ca_website', 'bbb_enrichment', 'chamber_enrichment', 'enrichment_digest',
+        'federal_grants', 'orgbook_bc', 'cra_charities', 'importers_canada', 'ottawa_biz_lic', 'cipo_trademarks', 'lobbyist_registry'];
 
     if (!validSources.includes(source)) {
         return res.status(400).json({ error: `Invalid source. Valid: ${validSources.join(', ')}` });
@@ -4541,6 +7531,45 @@ app.post('/api/scrape/trigger/:source', async (req, res) => {
             await firmWebsiteEnricher.enrich(dbClient);
         } else if (source === 'sme_email_enrichment') {
             await smeEmailEnricher.enrich(dbClient);
+        } else if (source === 'vancouver_biz_lic') {
+            await vancouverBizLicScraper.scrape(dbClient);
+        } else if (source === 'calgary_biz_lic') {
+            await calgaryBizLicScraper.scrape(dbClient);
+        } else if (source === 'toronto_biz_lic') {
+            await torontoBizLicScraper.scrape(dbClient);
+        } else if (source === 'edmonton_biz_lic') {
+            await edmontonBizLicScraper.scrape(dbClient);
+        } else if (source === 'all_municipal') {
+            await vancouverBizLicScraper.scrape(dbClient);
+            await torontoBizLicScraper.scrape(dbClient);
+            await calgaryBizLicScraper.scrape(dbClient);
+            await edmontonBizLicScraper.scrape(dbClient);
+        } else if (source === 'priority_scoring') {
+            await businessPriorityScorer.score(dbClient);
+        } else if (source === 'yellowpages_website') {
+            await yellowPagesEnricher.enrich(dbClient);
+        } else if (source === '411ca_website') {
+            await directory411Enricher.enrich(dbClient);
+        } else if (source === 'bbb_enrichment') {
+            await bbbProfileEnricher.enrich(dbClient);
+        } else if (source === 'chamber_enrichment') {
+            await chamberDirectoryEnricher.enrich(dbClient);
+        } else if (source === 'enrichment_digest') {
+            await sendEnrichmentDigest(dbClient);
+        } else if (source === 'federal_grants') {
+            await federalGrantsLoader.scrape(dbClient);
+        } else if (source === 'orgbook_bc') {
+            await orgBookBCScraper.scrape(dbClient);
+        } else if (source === 'cra_charities') {
+            await craCharitiesLoader.scrape(dbClient);
+        } else if (source === 'importers_canada') {
+            await canadianImportersLoader.scrape(dbClient);
+        } else if (source === 'ottawa_biz_lic') {
+            await ottawaBizLicScraper.scrape(dbClient);
+        } else if (source === 'cipo_trademarks') {
+            await cipoTrademarkLoader.scrape(dbClient);
+        } else if (source === 'lobbyist_registry') {
+            await lobbyistRegistryLoader.scrape(dbClient);
         } else {
             await cpaScraperOrchestrator.runSingle(source, dbClient);
         }
@@ -4697,8 +7726,12 @@ app.get('/api/scraped-smes/stats', async (req, res) => {
             SELECT
                 COUNT(*) AS total,
                 COUNT(CASE WHEN contact_email IS NOT NULL THEN 1 END) AS with_email,
+                COUNT(CASE WHEN website IS NOT NULL THEN 1 END) AS with_website,
+                COUNT(CASE WHEN email_verified = true THEN 1 END) AS verified_emails,
                 COUNT(CASE WHEN status = 'contacted' THEN 1 END) AS contacted,
-                COUNT(CASE WHEN status = 'converted' THEN 1 END) AS converted
+                COUNT(CASE WHEN status = 'converted' THEN 1 END) AS converted,
+                COUNT(CASE WHEN status = 'enrichment_attempted' THEN 1 END) AS enrichment_attempted,
+                COUNT(CASE WHEN status = 'enriched' THEN 1 END) AS enriched
             FROM scraped_smes
         `);
         const byProvince = await dbClient.query(`
@@ -4707,10 +7740,101 @@ app.get('/api/scraped-smes/stats', async (req, res) => {
         const byIndustry = await dbClient.query(`
             SELECT industry, COUNT(*) AS count FROM scraped_smes WHERE industry IS NOT NULL GROUP BY industry ORDER BY count DESC LIMIT 20
         `);
+        const byEnrichmentPhase = await dbClient.query(`
+            SELECT enrichment_phase, COUNT(*) AS count FROM scraped_smes GROUP BY enrichment_phase ORDER BY count DESC
+        `);
+        const byWebsiteSource = await dbClient.query(`
+            SELECT website_source, COUNT(*) AS count FROM scraped_smes WHERE website_source IS NOT NULL GROUP BY website_source ORDER BY count DESC
+        `);
+        const byVerificationMethod = await dbClient.query(`
+            SELECT email_verification_method, COUNT(*) AS count FROM scraped_smes WHERE email_verification_method IS NOT NULL GROUP BY email_verification_method ORDER BY count DESC
+        `);
 
-        res.json({ status: 'success', totals: result.rows[0], byProvince: byProvince.rows, byIndustry: byIndustry.rows });
+        res.json({
+            status: 'success',
+            totals: result.rows[0],
+            byProvince: byProvince.rows,
+            byIndustry: byIndustry.rows,
+            enrichmentPipeline: {
+                byPhase: byEnrichmentPhase.rows,
+                byWebsiteSource: byWebsiteSource.rows,
+                byVerificationMethod: byVerificationMethod.rows,
+            }
+        });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =====================================================
+// 🔗 INTERNAL PROSPECTS API (for lawyer + investing backends)
+// =====================================================
+app.get('/api/internal/prospects', async (req, res) => {
+    // Authenticate with shared secret
+    const authHeader = req.headers.authorization || '';
+    const expectedSecret = process.env.INTERNAL_API_SECRET;
+    if (!expectedSecret || authHeader !== `Bearer ${expectedSecret}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    try {
+        const { platform, min_score = 40, province, status = 'ready', limit = 500, offset = 0 } = req.query;
+
+        if (!platform || !['accountants', 'lawyers', 'investing'].includes(platform)) {
+            return res.status(400).json({ error: 'Invalid platform. Must be: accountants, lawyers, or investing' });
+        }
+
+        const scoreCol = `score_${platform}`;
+        const queueCol = `queue_status_${platform}`;
+        const conditions = [`${queueCol} = $1`, `${scoreCol} >= $2`];
+        const params = [status, parseInt(min_score)];
+        let paramIdx = 3;
+
+        if (province) {
+            const provinces = province.split(',').map(p => p.trim().toUpperCase());
+            conditions.push(`province = ANY($${paramIdx++})`);
+            params.push(provinces);
+        }
+
+        const lim = Math.min(500, parseInt(limit) || 500);
+        const off = parseInt(offset) || 0;
+
+        const where = conditions.join(' AND ');
+        const result = await dbClient.query(
+            `SELECT id, source, business_name, corporate_number, naics_code, industry, province, city,
+              business_status, employee_count, incorporation_date, years_in_business, business_type,
+              full_address, postal_code, contact_email, website, contact_phone, contact_name,
+              directors, data_sources, ${scoreCol} as score,
+              score_accountants, score_lawyers, score_investing
+            FROM scraped_smes WHERE ${where}
+            ORDER BY ${scoreCol} DESC NULLS LAST
+            LIMIT $${paramIdx++} OFFSET $${paramIdx}`,
+            [...params, lim, off]
+        );
+
+        const countResult = await dbClient.query(
+            `SELECT COUNT(*) FROM scraped_smes WHERE ${where}`,
+            params
+        );
+
+        // Mark pulled records as queued
+        if (result.rows.length > 0) {
+            const ids = result.rows.map(r => r.id);
+            await dbClient.query(
+                `UPDATE scraped_smes SET ${queueCol} = 'queued', updated_at = NOW() WHERE id = ANY($1)`,
+                [ids]
+            );
+        }
+
+        res.json({
+            success: true,
+            prospects: result.rows,
+            total: parseInt(countResult.rows[0].count),
+            hasMore: off + result.rows.length < parseInt(countResult.rows[0].count),
+        });
+    } catch (error) {
+        console.error('Internal prospects API error:', error.message);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -4811,6 +7935,19 @@ async function startServer() {
         console.log(`   GET  /api/analytics`);
     });
 
+    // Clean up stale running jobs from previous container (orphaned by restart/deploy)
+    try {
+        const staleResult = await dbClient.query(
+            `UPDATE scrape_jobs SET status = 'failed', error_message = 'Stale: container restart', completed_at = NOW()
+             WHERE status = 'running' AND started_at < NOW() - INTERVAL '4 hours'`
+        );
+        if (staleResult.rowCount > 0) {
+            console.log(`🧹 Cleaned up ${staleResult.rowCount} stale running job(s) from previous container`);
+        }
+    } catch (err) {
+        console.error('⚠️ Stale job cleanup failed (non-fatal):', err.message);
+    }
+
     // Run initial data collection in background (non-blocking, non-fatal)
     setTimeout(async () => {
         try {
@@ -4834,13 +7971,6 @@ async function startServer() {
     }, 24 * 60 * 60 * 1000);
 
     console.log('✅ 24-hour data collection scheduler activated');
-}
-
-// Sentry error handler (must be after all routes)
-if (process.env.SENTRY_DSN && Sentry.Handlers) {
-  app.use(Sentry.Handlers.errorHandler());
-} else if (process.env.SENTRY_DSN && Sentry.setupExpressErrorHandler) {
-  Sentry.setupExpressErrorHandler(app);
 }
 
 // Graceful shutdown
