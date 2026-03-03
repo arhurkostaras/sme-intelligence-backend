@@ -10,6 +10,7 @@ const cron = require('node-cron');
 const dns = require('dns').promises;
 const net = require('net');
 const crypto = require('crypto');
+const { createInterface } = require('readline');
 const Stripe = require('stripe');
 const { sendEmail, sendSubscriptionConfirmation, sendPaymentReceipt, sendPaymentFailedAlert } = require('./services/email');
 
@@ -4035,14 +4036,14 @@ class YellowPagesWebsiteEnricher {
         const score = this._fuzzyMatch(normalizedSearch, this._normalize(listingName));
         if (score > bestScore && score >= 0.6) {
           bestScore = score;
-          const websiteEl = $(el).find('a.listing__link--icon.website, a[data-analytics="website"], a[href*="redirect"]').first();
+          const websiteEl = $(el).find('li.mlr__item--website a, a[href*="/gourl/"]').first();
           const phoneEl = $(el).find('a.listing__link--icon.phone, span.mlr__sub-text, .listing__phone a').first();
 
           let website = null;
           const href = websiteEl.attr('href') || '';
           if (href && !href.includes('yellowpages.ca')) {
             // Extract actual URL from redirect links
-            const urlMatch = href.match(/[?&]url=([^&]+)/) || href.match(/redirect[?/].*?url=([^&]+)/);
+            const urlMatch = href.match(/[?&]redirect=([^&]+)/);
             website = urlMatch ? decodeURIComponent(urlMatch[1]) : (href.startsWith('http') ? href : null);
           }
 
@@ -4376,7 +4377,7 @@ class BBBProfileEnricher {
       let bestScore = 0;
 
       // BBB search results
-      $('a[data-bbb-link="business-name"], .result-name a, .bds-body a[href*="/profile/"]').each((_, el) => {
+      $('.result-business-name a, a.text-blue-medium[href*="/profile/"]').each((_, el) => {
         const listingName = $(el).text().trim();
         if (!listingName) return;
 
@@ -4407,10 +4408,18 @@ class BBBProfileEnricher {
       let phone = null;
 
       // Website link
-      $p('a[href*="http"][data-bbb-link="business-website"], a.business-website, a[data-tracking="website"]').each((_, el) => {
+      $p('a[href^="http"][target="_blank"]').each((_, el) => {
         const href = $p(el).attr('href');
-        if (href && !href.includes('bbb.org')) website = href;
+        const text = $p(el).text().trim();
+        if (text.includes('Visit Website') && href && !href.includes('bbb.org')) {
+          website = href;
+        }
       });
+      if (!website) {
+        const pageHtml = $p.html();
+        const primaryMatch = pageHtml.match(/"primary":"(https?:\/\/[^"]+)"/);
+        if (primaryMatch) website = primaryMatch[1];
+      }
 
       // Phone
       $p('a[href^="tel:"], .business-phone, .dtm-phone').each((_, el) => {
@@ -4667,8 +4676,8 @@ class FederalGrantsLoader {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      // Download the CSV from Open Canada
-      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=432527ab-7aac-45b5-81d6-7597107a7f8d', {
+      // Download the CSV from Open Canada (streaming - file is 2.2GB)
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=432527ab-7aac-45b5-81d6-7597107a7013', {
         timeout: 30000,
         headers: { 'User-Agent': this.userAgent },
       });
@@ -4676,30 +4685,32 @@ class FederalGrantsLoader {
       const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
       if (!csvResource) throw new Error('No CSV resource found in federal grants dataset');
 
-      console.log(`[FederalGrants] Downloading CSV from: ${csvResource.url}`);
+      console.log(`[FederalGrants] Downloading CSV (streaming) from: ${csvResource.url}`);
       const csvResp = await axios.get(csvResource.url, {
-        timeout: 600000,
+        timeout: 1200000, // 20 min for large file
         headers: { 'User-Agent': this.userAgent },
-        maxContentLength: 500 * 1024 * 1024,
+        responseType: 'stream',
       });
 
-      const lines = csvResp.data.split('\n');
-      if (lines.length < 2) throw new Error('Empty CSV');
-
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-      const colIdx = {};
-      headers.forEach((h, i) => { colIdx[h] = i; });
-
-      const nameCol = colIdx['recipient_name'] ?? colIdx['recipient_legal_name'] ?? colIdx['owner_org'] ?? 0;
-      const provCol = colIdx['recipient_province'] ?? colIdx['recipient_prov'] ?? colIdx['province'];
-      const cityCol = colIdx['recipient_city'] ?? colIdx['city'];
-      const valueCol = colIdx['agreement_value'] ?? colIdx['total_funding'] ?? colIdx['amount'];
-      const programCol = colIdx['program_name'] ?? colIdx['program'] ?? colIdx['agreement_type'];
+      const rl = createInterface({ input: csvResp.data, crlfDelay: Infinity });
+      let headers = null;
+      let colIdx = {};
+      let nameCol, provCol, cityCol, valueCol, programCol;
 
       const batch = [];
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
+      for await (const rawLine of rl) {
+        const line = rawLine.trim();
         if (!line) continue;
+        if (!headers) {
+          headers = line.split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+          headers.forEach((h, i) => { colIdx[h] = i; });
+          nameCol = colIdx['recipient_name'] ?? colIdx['recipient_legal_name'] ?? colIdx['owner_org'] ?? 0;
+          provCol = colIdx['recipient_province'] ?? colIdx['recipient_prov'] ?? colIdx['province'];
+          cityCol = colIdx['recipient_city'] ?? colIdx['city'];
+          valueCol = colIdx['agreement_value'] ?? colIdx['total_funding'] ?? colIdx['amount'];
+          programCol = colIdx['program_name'] ?? colIdx['program'] ?? colIdx['agreement_type'];
+          continue;
+        }
         totalFound++;
 
         const cols = this._parseCSVLine(line);
@@ -4721,6 +4732,7 @@ class FederalGrantsLoader {
           totalInserted += r.inserted;
           totalSkipped += r.skipped;
           batch.length = 0;
+          if (totalFound % 100000 === 0) console.log(`[FederalGrants] Progress: ${totalFound} processed, ${totalInserted} new`);
         }
       }
       if (batch.length > 0) {
@@ -4824,7 +4836,7 @@ class OrgBookBCScraper {
           const name = entity.names?.[0]?.text || entity.topic?.source_id || '';
           if (!name || name.length < 2) continue;
 
-          const sourceId = entity.topic?.source_id || '';
+          const sourceId = entity.source_id || '';
           const hash = nameProvinceHash(name, 'BC');
 
           try {
@@ -4882,7 +4894,7 @@ class CRACharitiesLoader {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=d79983b8-91f0-4bbd-a87d-2a9f50c7e3e4', {
+      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=05b3abd0-e70f-4b3b-a9c5-acc436bd15b6', {
         timeout: 30000, headers: { 'User-Agent': this.userAgent },
       });
       const resources = metaResp.data?.result?.resources || [];
@@ -4994,42 +5006,34 @@ class CanadianImportersLoader {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=4e2e5e56-0370-4804-90cf-6b2e35bcd20e', {
-        timeout: 30000, headers: { 'User-Agent': this.userAgent },
-      });
-      const resources = metaResp.data?.result?.resources || [];
-      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
-      if (!csvResource) throw new Error('No CSV resource found in importers dataset');
-
-      console.log(`[Importers] Downloading CSV from: ${csvResource.url}`);
-      const csvResp = await axios.get(csvResource.url, {
-        timeout: 600000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 500 * 1024 * 1024,
+      // Direct XLSX download (no CSV available on CKAN)
+      const xlsxUrl = 'https://ised-isde.canada.ca/site/canadian-importers-database/sites/default/files/documents/MajorImportersbycity2023.xlsx';
+      console.log(`[Importers] Downloading XLSX from: ${xlsxUrl}`);
+      const xlsxResp = await axios.get(xlsxUrl, {
+        timeout: 120000,
+        headers: { 'User-Agent': this.userAgent },
+        responseType: 'arraybuffer',
       });
 
-      const lines = csvResp.data.split('\n');
-      if (lines.length < 2) throw new Error('Empty CSV');
+      const XLSX = require('xlsx');
+      const workbook = XLSX.read(xlsxResp.data, { type: 'buffer' });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet);
 
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-      const colIdx = {};
-      headers.forEach((h, i) => { colIdx[h] = i; });
-
-      const nameCol = colIdx['importer_name'] ?? colIdx['name'] ?? colIdx['business_name'] ?? 0;
-      const provCol = colIdx['province'] ?? colIdx['prov'];
-      const cityCol = colIdx['city'];
+      console.log(`[Importers] Parsed ${rows.length} rows from XLSX`);
 
       const batch = [];
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
+      for (const row of rows) {
         totalFound++;
 
-        const cols = this._parseCSVLine(line);
-        const name = (cols[nameCol] || '').trim();
+        // Try common column name variations
+        const name = (row['Importer Name'] || row['importer_name'] || row['Name'] || row['name'] || row['Business Name'] || row['business_name'] || '').toString().trim();
         if (!name || name.length < 3) continue;
 
-        const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
+        const province = (row['Province'] || row['province'] || row['Prov'] || row['prov'] || '').toString().trim().toUpperCase().substring(0, 2);
+        const city = (row['City'] || row['city'] || '').toString().trim();
 
-        batch.push({ name, province, city: cityCol !== undefined ? (cols[cityCol] || '').trim() : '' });
+        batch.push({ name, province, city });
 
         if (batch.length >= 500) {
           const r = await this._insertBatch(dbClient, batch, jobId);
@@ -5100,59 +5104,8 @@ class OttawaBizLicScraper {
   }
 
   async scrape(dbClient) {
-    console.log('🏙️ Starting Ottawa Business Licences scrape...');
-    const jobId = await this._startJob(dbClient);
-    let totalFound = 0, totalInserted = 0, totalSkipped = 0;
-
-    try {
-      let offset = 0;
-      let hasMore = true;
-
-      while (hasMore) {
-        const response = await axios.get(this.baseUrl, {
-          params: {
-            where: '1=1',
-            outFields: '*',
-            f: 'json',
-            resultOffset: offset,
-            resultRecordCount: 1000,
-          },
-          timeout: 30000,
-        });
-
-        const features = response.data?.features || [];
-        if (features.length === 0) { hasMore = false; break; }
-
-        for (const feature of features) {
-          totalFound++;
-          const attrs = feature.attributes || {};
-          const name = (attrs.BUSINESS_NAME || attrs.TRADE_NAME || attrs.NAME || '').trim();
-          if (!name || name.length < 2) continue;
-
-          const hash = nameProvinceHash(name, 'ON');
-          try {
-            await dbClient.query(
-              `INSERT INTO scraped_smes (source, business_name, province, city, full_address, name_province_hash, scrape_job_id, industry)
-               VALUES ($1, $2, 'ON', 'Ottawa', $3, $4, $5, $6)
-               ON CONFLICT (name_province_hash) WHERE name_province_hash IS NOT NULL DO NOTHING`,
-              [this.source, name, attrs.ADDRESS || attrs.WARD || '', hash, jobId, attrs.LICENCE_TYPE || attrs.CATEGORY || '']
-            );
-            totalInserted++;
-          } catch (err) { totalSkipped++; }
-        }
-
-        offset += features.length;
-        if (offset % 5000 === 0) console.log(`[OttawaBizLic] Progress: ${offset} fetched, ${totalInserted} new`);
-        await delay(this.delayMs);
-      }
-
-      await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
-      console.log(`✅ Ottawa Biz Lic: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
-    } catch (error) {
-      await this._failJob(dbClient, jobId, error.message);
-      console.error('❌ Ottawa Biz Lic failed:', error.message);
-    }
-    return { found: totalFound, inserted: totalInserted, skipped: totalSkipped };
+    console.log('🏙️ Ottawa Business Licences: DISABLED - ArcGIS service no longer available');
+    return { found: 0, inserted: 0, skipped: 0 };
   }
 
   async _startJob(dbClient) { const r = await dbClient.query(`INSERT INTO scrape_jobs (source,status) VALUES ($1,'running') RETURNING id`, [this.source]); return r.rows[0].id; }
@@ -5176,33 +5129,48 @@ class CIPOTrademarkLoader {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=fe09c9a8-3c3e-4ce9-8412-a5c03ebae8ea', {
+      // Scrape the CIPO page to find the current interested_party URL
+      const pageResp = await axios.get('https://ised-isde.canada.ca/site/canadian-intellectual-property-office/en/canadian-intellectual-property-statistics/trademarks-researcher-datasets-applications-and-registrations-csv-and-txt', {
         timeout: 30000, headers: { 'User-Agent': this.userAgent },
       });
-      const resources = metaResp.data?.result?.resources || [];
-      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
-      if (!csvResource) throw new Error('No CSV resource found in CIPO trademarks dataset');
+      const urlMatch = pageResp.data.match(/href="(https:\/\/opic-cipo\.ca\/cipo\/client_downloads\/[^"]*TM_interested_party[^"]*\.zip)"/);
+      if (!urlMatch) throw new Error('Could not find TM_interested_party ZIP URL on CIPO page');
 
-      console.log(`[CIPOTrademarks] Downloading CSV from: ${csvResource.url}`);
-      const csvResp = await axios.get(csvResource.url, {
-        timeout: 600000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 500 * 1024 * 1024,
+      const zipUrl = urlMatch[1];
+      console.log(`[CIPOTrademarks] Downloading ZIP from: ${zipUrl}`);
+
+      const zipResp = await axios.get(zipUrl, {
+        timeout: 600000,
+        headers: { 'User-Agent': this.userAgent },
+        responseType: 'arraybuffer',
+        maxContentLength: 200 * 1024 * 1024,
       });
 
-      const lines = csvResp.data.split('\n');
-      if (lines.length < 2) throw new Error('Empty CSV');
+      const AdmZip = require('adm-zip');
+      const zip = new AdmZip(Buffer.from(zipResp.data));
+      const entries = zip.getEntries();
+      const csvEntry = entries.find(e => e.entryName.endsWith('.csv') || e.entryName.endsWith('.txt'));
+      if (!csvEntry) throw new Error('No CSV/TXT file found in ZIP');
+
+      console.log(`[CIPOTrademarks] Parsing: ${csvEntry.entryName}`);
+      const csvData = csvEntry.getData().toString('utf-8');
+      const lines = csvData.split('\n');
+
+      if (lines.length < 2) throw new Error('Empty CSV in ZIP');
 
       const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
       const colIdx = {};
       headers.forEach((h, i) => { colIdx[h] = i; });
 
-      const nameCol = colIdx['applicant_name'] ?? colIdx['owner_name'] ?? colIdx['name'] ?? 0;
-      const provCol = colIdx['applicant_province'] ?? colIdx['province'] ?? colIdx['prov'];
-      const dateCol = colIdx['filing_date'] ?? colIdx['application_date'] ?? colIdx['date'];
+      // Column names in the interested_party file
+      const nameCol = colIdx['interestedpartyname'] ?? colIdx['interested_party_name'] ?? colIdx['name'] ?? colIdx['applicant_name'] ?? 0;
+      const provCol = colIdx['interestedpartyprovince'] ?? colIdx['province'] ?? colIdx['applicant_province'];
+      const countryCol = colIdx['interestedpartycountry'] ?? colIdx['country'];
 
-      // Only keep filings from the last 2 years
       const twoYearsAgo = new Date();
       twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
 
+      const seen = new Set();
       const batch = [];
       for (let i = 1; i < lines.length; i++) {
         const line = lines[i].trim();
@@ -5213,11 +5181,16 @@ class CIPOTrademarkLoader {
         const name = (cols[nameCol] || '').trim();
         if (!name || name.length < 3) continue;
 
-        // Filter for recent filings only
-        if (dateCol !== undefined) {
-          const filingDate = new Date(cols[dateCol] || '');
-          if (!isNaN(filingDate.getTime()) && filingDate < twoYearsAgo) continue;
+        // Filter for Canadian entries if country column exists
+        if (countryCol !== undefined) {
+          const country = (cols[countryCol] || '').trim().toUpperCase();
+          if (country && country !== 'CA' && country !== 'CANADA') continue;
         }
+
+        // Deduplicate within load
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
 
         const province = provCol !== undefined ? (cols[provCol] || '').trim().toUpperCase().substring(0, 2) : '';
 
@@ -5227,7 +5200,7 @@ class CIPOTrademarkLoader {
           const r = await this._insertBatch(dbClient, batch, jobId);
           totalInserted += r.inserted; totalSkipped += r.skipped;
           batch.length = 0;
-          if (totalFound % 20000 === 0) console.log(`[CIPOTrademarks] Progress: ${totalFound} processed, ${totalInserted} new`);
+          if (seen.size % 20000 === 0) console.log(`[CIPOTrademarks] Progress: ${totalFound} processed, ${totalInserted} new`);
         }
       }
       if (batch.length > 0) {
@@ -5296,20 +5269,26 @@ class LobbyistRegistryLoader {
     let totalFound = 0, totalInserted = 0, totalSkipped = 0;
 
     try {
-      const metaResp = await axios.get('https://open.canada.ca/data/api/3/action/package_show?id=7ec4e2fc-a90e-4eea-863a-3b8d3c3f1069', {
-        timeout: 30000, headers: { 'User-Agent': this.userAgent },
-      });
-      const resources = metaResp.data?.result?.resources || [];
-      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
-      if (!csvResource) throw new Error('No CSV resource found in lobbyist registry dataset');
+      const zipUrl = 'https://lobbycanada.gc.ca/media/zwcjycef/registrations_enregistrements_ocl_cal.zip';
+      console.log(`[LobbyistRegistry] Downloading ZIP from: ${zipUrl}`);
 
-      console.log(`[LobbyistRegistry] Downloading CSV from: ${csvResource.url}`);
-      const csvResp = await axios.get(csvResource.url, {
-        timeout: 300000, headers: { 'User-Agent': this.userAgent }, maxContentLength: 200 * 1024 * 1024,
+      const zipResp = await axios.get(zipUrl, {
+        timeout: 600000,
+        headers: { 'User-Agent': this.userAgent },
+        responseType: 'arraybuffer',
+        maxContentLength: 200 * 1024 * 1024,
       });
 
-      const lines = csvResp.data.split('\n');
-      if (lines.length < 2) throw new Error('Empty CSV');
+      const AdmZip = require('adm-zip');
+      const zip = new AdmZip(Buffer.from(zipResp.data));
+      const entries = zip.getEntries();
+      const csvEntry = entries.find(e => e.entryName.endsWith('.csv'));
+      if (!csvEntry) throw new Error('No CSV file found in ZIP');
+
+      console.log(`[LobbyistRegistry] Parsing: ${csvEntry.entryName}`);
+      const csvData = csvEntry.getData().toString('utf-8');
+      const lines = csvData.split('\n');
+      if (lines.length < 2) throw new Error('Empty CSV in ZIP');
 
       const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
       const colIdx = {};
