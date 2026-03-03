@@ -5026,12 +5026,14 @@ class CanadianImportersLoader {
       for (const row of rows) {
         totalFound++;
 
-        // Try common column name variations
-        const name = (row['Importer Name'] || row['importer_name'] || row['Name'] || row['name'] || row['Business Name'] || row['business_name'] || '').toString().trim();
+        // XLSX columns: COMPANY-ENTREPRISE, PROVINCE_ENG, CITY-VILLE, POSTAL_CODE-CODE_POSTAL
+        const name = (row['COMPANY-ENTREPRISE'] || row['Importer Name'] || row['importer_name'] || row['Name'] || row['Business Name'] || '').toString().trim();
         if (!name || name.length < 3) continue;
 
-        const province = (row['Province'] || row['province'] || row['Prov'] || row['prov'] || '').toString().trim().toUpperCase().substring(0, 2);
-        const city = (row['City'] || row['city'] || '').toString().trim();
+        const provFull = (row['PROVINCE_ENG'] || row['Province'] || row['province'] || '').toString().trim();
+        const provMap = { 'Alberta': 'AB', 'British Columbia': 'BC', 'Manitoba': 'MB', 'New Brunswick': 'NB', 'Newfoundland and Labrador': 'NL', 'Nova Scotia': 'NS', 'Ontario': 'ON', 'Prince Edward Island': 'PE', 'Quebec': 'QC', 'Saskatchewan': 'SK', 'Northwest Territories': 'NT', 'Nunavut': 'NU', 'Yukon': 'YT' };
+        const province = provMap[provFull] || provFull.toUpperCase().substring(0, 2);
+        const city = (row['CITY-VILLE'] || row['City'] || row['city'] || '').toString().trim();
 
         batch.push({ name, province, city });
 
@@ -5139,18 +5141,24 @@ class CIPOTrademarkLoader {
       const zipUrl = urlMatch[1];
       console.log(`[CIPOTrademarks] Downloading ZIP from: ${zipUrl}`);
 
+      const https = require('https');
+      const agent = new https.Agent({ rejectUnauthorized: false });
       const zipResp = await axios.get(zipUrl, {
         timeout: 600000,
         headers: { 'User-Agent': this.userAgent },
         responseType: 'arraybuffer',
         maxContentLength: 200 * 1024 * 1024,
+        httpsAgent: agent,
       });
 
       const AdmZip = require('adm-zip');
       const zip = new AdmZip(Buffer.from(zipResp.data));
       const entries = zip.getEntries();
-      const csvEntry = entries.find(e => e.entryName.endsWith('.csv') || e.entryName.endsWith('.txt'));
-      if (!csvEntry) throw new Error('No CSV/TXT file found in ZIP');
+      const csvEntry = entries.find(e => e.entryName.toLowerCase().includes('interested_party') && (e.entryName.endsWith('.csv') || e.entryName.endsWith('.txt')));
+      if (!csvEntry) {
+        const allNames = entries.map(e => e.entryName).join(', ');
+        throw new Error(`No interested_party CSV found in ZIP. Files: ${allNames}`);
+      }
 
       console.log(`[CIPOTrademarks] Parsing: ${csvEntry.entryName}`);
       const csvData = csvEntry.getData().toString('utf-8');
