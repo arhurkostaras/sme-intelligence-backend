@@ -5147,11 +5147,15 @@ class CIPOTrademarkLoader {
         timeout: 600000,
         headers: { 'User-Agent': this.userAgent },
         responseType: 'arraybuffer',
-        maxContentLength: 200 * 1024 * 1024,
+        maxContentLength: 500 * 1024 * 1024,
         httpsAgent: agent,
       });
 
+      // Extract ZIP to temp file and stream-read (CSV is >500MB, can't fit in a single string)
       const AdmZip = require('adm-zip');
+      const fs = require('fs');
+      const os = require('os');
+      const path = require('path');
       const zip = new AdmZip(Buffer.from(zipResp.data));
       const entries = zip.getEntries();
       const csvEntry = entries.find(e => e.entryName.toLowerCase().includes('interested_party') && (e.entryName.endsWith('.csv') || e.entryName.endsWith('.txt')));
@@ -5160,32 +5164,37 @@ class CIPOTrademarkLoader {
         throw new Error(`No interested_party CSV found in ZIP. Files: ${allNames}`);
       }
 
-      console.log(`[CIPOTrademarks] Parsing: ${csvEntry.entryName}`);
-      const csvData = csvEntry.getData().toString('utf-8');
-      const lines = csvData.split('\n');
+      console.log(`[CIPOTrademarks] Extracting: ${csvEntry.entryName} (${(csvEntry.header.size / 1024 / 1024).toFixed(0)}MB)`);
+      const tmpDir = os.tmpdir();
+      const tmpFile = path.join(tmpDir, 'cipo_interested_party.csv');
+      zip.extractEntryTo(csvEntry, tmpDir, false, true, false, 'cipo_interested_party.csv');
 
-      if (lines.length < 2) throw new Error('Empty CSV in ZIP');
+      // Stream-read the extracted CSV
+      const rl = createInterface({ input: fs.createReadStream(tmpFile, { encoding: 'utf-8' }), crlfDelay: Infinity });
 
-      const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-      const colIdx = {};
-      headers.forEach((h, i) => { colIdx[h] = i; });
-
-      // Column names in the interested_party file
-      const nameCol = colIdx['interestedpartyname'] ?? colIdx['interested_party_name'] ?? colIdx['name'] ?? colIdx['applicant_name'] ?? 0;
-      const provCol = colIdx['interestedpartyprovince'] ?? colIdx['province'] ?? colIdx['applicant_province'];
-      const countryCol = colIdx['interestedpartycountry'] ?? colIdx['country'];
-
-      const twoYearsAgo = new Date();
-      twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-
+      let headerLine = null;
+      let colIdx = {};
+      let nameCol, provCol, countryCol;
       const seen = new Set();
       const batch = [];
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
+
+      for await (const line of rl) {
+        if (!headerLine) {
+          headerLine = line;
+          const headers = headerLine.split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
+          headers.forEach((h, i) => { colIdx[h] = i; });
+          nameCol = colIdx['interestedpartyname'] ?? colIdx['interested_party_name'] ?? colIdx['name'] ?? colIdx['applicant_name'] ?? 0;
+          provCol = colIdx['interestedpartyprovince'] ?? colIdx['province'] ?? colIdx['applicant_province'];
+          countryCol = colIdx['interestedpartycountry'] ?? colIdx['country'];
+          console.log(`[CIPOTrademarks] Headers: ${headers.slice(0, 8).join(', ')}... nameCol=${nameCol}, provCol=${provCol}, countryCol=${countryCol}`);
+          continue;
+        }
+
+        const trimmed = line.trim();
+        if (!trimmed) continue;
         totalFound++;
 
-        const cols = this._parseCSVLine(line);
+        const cols = this._parseCSVLine(trimmed);
         const name = (cols[nameCol] || '').trim();
         if (!name || name.length < 3) continue;
 
@@ -5215,6 +5224,9 @@ class CIPOTrademarkLoader {
         const r = await this._insertBatch(dbClient, batch, jobId);
         totalInserted += r.inserted; totalSkipped += r.skipped;
       }
+
+      // Clean up temp file
+      try { fs.unlinkSync(tmpFile); } catch(e) {}
 
       await this._completeJob(dbClient, jobId, totalFound, totalInserted, totalSkipped);
       console.log(`✅ CIPO Trademarks: ${totalFound} found, ${totalInserted} new, ${totalSkipped} skipped`);
