@@ -5173,7 +5173,7 @@ class CIPOTrademarkLoader {
       const rl = createInterface({ input: fs.createReadStream(tmpFile, { encoding: 'utf-8' }), crlfDelay: Infinity });
 
       let headerLine = null;
-      let colIdx = {};
+      let delimiter = ',';
       let nameCol, provCol, countryCol;
       const seen = new Set();
       const batch = [];
@@ -5181,12 +5181,19 @@ class CIPOTrademarkLoader {
       for await (const line of rl) {
         if (!headerLine) {
           headerLine = line;
-          const headers = headerLine.split(',').map(h => h.trim().replace(/"/g, '').toLowerCase());
-          headers.forEach((h, i) => { colIdx[h] = i; });
-          nameCol = colIdx['interestedpartyname'] ?? colIdx['interested_party_name'] ?? colIdx['name'] ?? colIdx['applicant_name'] ?? 0;
-          provCol = colIdx['interestedpartyprovince'] ?? colIdx['province'] ?? colIdx['applicant_province'];
-          countryCol = colIdx['interestedpartycountry'] ?? colIdx['country'];
-          console.log(`[CIPOTrademarks] Headers: ${headers.slice(0, 8).join(', ')}... nameCol=${nameCol}, provCol=${provCol}, countryCol=${countryCol}`);
+          // Auto-detect delimiter (pipe-delimited is common for CIPO)
+          if (headerLine.includes('|') && headerLine.split('|').length > headerLine.split(',').length) delimiter = '|';
+          const headers = headerLine.split(delimiter).map(h => h.trim().replace(/"/g, '').toLowerCase());
+          // Find columns by partial match (bilingual headers like "party name - nom de la partie")
+          nameCol = headers.findIndex(h => h.includes('party name') || h.includes('nom de la partie'));
+          provCol = headers.findIndex(h => h.includes('party province') || h.includes('province de la partie'));
+          countryCol = headers.findIndex(h => h.includes('party country') || h.includes('pays de la partie'));
+          if (nameCol < 0) nameCol = headers.findIndex(h => h.includes('owner legal name') || h.includes('nom légal'));
+          if (nameCol < 0) nameCol = 3; // fallback to typical position
+          if (provCol < 0) provCol = undefined;
+          if (countryCol < 0) countryCol = undefined;
+          console.log(`[CIPOTrademarks] Delimiter: '${delimiter}', ${headers.length} cols. nameCol=${nameCol}, provCol=${provCol}, countryCol=${countryCol}`);
+          console.log(`[CIPOTrademarks] Sample headers: ${headers.slice(0, 5).join(' | ')}`);
           continue;
         }
 
@@ -5194,7 +5201,7 @@ class CIPOTrademarkLoader {
         if (!trimmed) continue;
         totalFound++;
 
-        const cols = this._parseCSVLine(trimmed);
+        const cols = delimiter === '|' ? trimmed.split('|').map(c => c.trim()) : this._parseCSVLine(trimmed);
         const name = (cols[nameCol] || '').trim();
         if (!name || name.length < 3) continue;
 
