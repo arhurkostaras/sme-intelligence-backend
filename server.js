@@ -4898,7 +4898,8 @@ class CRACharitiesLoader {
         timeout: 30000, headers: { 'User-Agent': this.userAgent },
       });
       const resources = metaResp.data?.result?.resources || [];
-      const csvResource = resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
+      // Prefer the identification file (main charity list) over directors/financial files
+      const csvResource = resources.find(r => r.url?.includes('ident_')) || resources.find(r => r.format === 'CSV' || r.url?.endsWith('.csv'));
       if (!csvResource) throw new Error('No CSV resource found in CRA Charities dataset');
 
       console.log(`[CRACharities] Downloading CSV from: ${csvResource.url}`);
