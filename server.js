@@ -3071,7 +3071,9 @@ class FirmWebsiteEnricher {
         for (const cpa of cpasNoFirm.rows) {
           totalProcessed++;
           try {
-            const result = await this._findEmailNoFirm(cpa);
+            // Try Apollo first for no-firm CPAs
+            let result = await this._apolloLookup(cpa, dbClient);
+            if (!result) result = await this._findEmailNoFirm(cpa);
             if (result) {
               // Dedup: skip if this email is already assigned to 2+ other professionals
               const dupeCheck = await dbClient.query(
@@ -3116,8 +3118,45 @@ class FirmWebsiteEnricher {
     return { processed: totalProcessed, enriched: totalEnriched };
   }
 
+  async _apolloLookup(professional, dbClient) {
+    if (!process.env.APOLLO_API_KEY) return null;
+    try {
+      const dailyLimit = parseInt(process.env.APOLLO_DAILY_LIMIT) || 50;
+      const today = new Date().toISOString().slice(0, 10);
+      const used = await dbClient.query(
+        `SELECT COALESCE(SUM(records_updated), 0) as credits FROM scrape_jobs WHERE source = 'apollo_enrichment' AND started_at::date = $1::date`,
+        [today]
+      );
+      if (parseInt(used.rows[0].credits) >= dailyLimit) return null;
+
+      const payload = { first_name: professional.first_name, last_name: professional.last_name };
+      if (professional.firm_name) payload.organization_name = professional.firm_name;
+
+      const res = await axios.post('https://api.apollo.io/api/v1/people/match', payload, {
+        headers: { 'x-api-key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
+        timeout: 10000
+      });
+
+      await dbClient.query(
+        `INSERT INTO scrape_jobs (source, status, records_updated, started_at, completed_at) VALUES ('apollo_enrichment', 'completed', 1, NOW(), NOW())`
+      );
+
+      if (res.data?.person?.email) {
+        return { email: res.data.person.email, source: `apollo:${res.data.person.email_confidence || 'high'}` };
+      }
+      return null;
+    } catch (err) {
+      console.error(`[Apollo] Lookup failed for ${professional.first_name} ${professional.last_name}:`, err.message);
+      return null;
+    }
+  }
+
   // Strategy 1: CPA has a firm name — try to find firm website and extract emails
   async _findEmailForCPA(cpa, dbClient) {
+    // Priority 0: Apollo.io lookup
+    const apolloResult = await this._apolloLookup(cpa, dbClient);
+    if (apolloResult) return apolloResult;
+
     const firmName = cpa.firm_name;
     if (!firmName) return null;
 
@@ -3607,7 +3646,52 @@ class SMEEmailEnricher {
     }
   }
 
+  async _apolloLookup(sme, dbClient) {
+    if (!process.env.APOLLO_API_KEY) return null;
+    // SME enrichment: try to match business contact person
+    const contactName = sme.contact_name || '';
+    const nameParts = contactName.split(/\s+/);
+    if (nameParts.length < 2) return null; // Need at least first + last name
+
+    try {
+      const dailyLimit = parseInt(process.env.APOLLO_DAILY_LIMIT) || 50;
+      const today = new Date().toISOString().slice(0, 10);
+      const used = await dbClient.query(
+        `SELECT COALESCE(SUM(records_updated), 0) as credits FROM scrape_jobs WHERE source = 'apollo_enrichment' AND started_at::date = $1::date`,
+        [today]
+      );
+      if (parseInt(used.rows[0].credits) >= dailyLimit) return null;
+
+      const payload = {
+        first_name: nameParts[0],
+        last_name: nameParts.slice(1).join(' '),
+        organization_name: sme.business_name,
+      };
+
+      const res = await axios.post('https://api.apollo.io/api/v1/people/match', payload, {
+        headers: { 'x-api-key': process.env.APOLLO_API_KEY, 'Content-Type': 'application/json' },
+        timeout: 10000
+      });
+
+      await dbClient.query(
+        `INSERT INTO scrape_jobs (source, status, records_updated, started_at, completed_at) VALUES ('apollo_enrichment', 'completed', 1, NOW(), NOW())`
+      );
+
+      if (res.data?.person?.email) {
+        return { email: res.data.person.email, source: `apollo:${res.data.person.email_confidence || 'high'}`, phase: 'apollo' };
+      }
+      return null;
+    } catch (err) {
+      console.error(`[Apollo] SME lookup failed for ${sme.business_name}:`, err.message);
+      return null;
+    }
+  }
+
   async _findEmailForSME(sme, dbClient) {
+    // Priority 0: Apollo.io lookup
+    const apolloResult = await this._apolloLookup(sme, dbClient);
+    if (apolloResult) return apolloResult;
+
     const businessName = sme.business_name;
     if (!businessName) return null;
 
