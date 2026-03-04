@@ -5134,7 +5134,7 @@ class CIPOTrademarkLoader {
     try {
       // Scrape the CIPO page to find the current interested_party URL
       const pageResp = await axios.get('https://ised-isde.canada.ca/site/canadian-intellectual-property-office/en/canadian-intellectual-property-statistics/trademarks-researcher-datasets-applications-and-registrations-csv-and-txt', {
-        timeout: 30000, headers: { 'User-Agent': this.userAgent },
+        timeout: 120000, headers: { 'User-Agent': this.userAgent },
       });
       const urlMatch = pageResp.data.match(/href="(https:\/\/opic-cipo\.ca\/cipo\/client_downloads\/[^"]*TM_interested_party[^"]*\.zip)"/);
       if (!urlMatch) throw new Error('Could not find TM_interested_party ZIP URL on CIPO page');
