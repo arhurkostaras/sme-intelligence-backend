@@ -4826,11 +4826,21 @@ class OrgBookBCScraper {
       const orgbookAgent = new https.Agent({ rejectUnauthorized: false });
 
       while (hasMore) {
-        const response = await axios.get(this.baseUrl, {
-          params: { q: '*', inactive: false, latest: true, rows: this.batchSize, start },
-          timeout: 30000,
-          httpsAgent: orgbookAgent,
-        });
+        let response;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            response = await axios.get(this.baseUrl, {
+              params: { q: '*', inactive: false, latest: true, rows: this.batchSize, start },
+              timeout: 60000,
+              httpsAgent: orgbookAgent,
+            });
+            break;
+          } catch (retryErr) {
+            if (attempt === 3) throw retryErr;
+            console.log(`[OrgBookBC] Request failed at start=${start}, retrying (${attempt}/3)...`);
+            await new Promise(r => setTimeout(r, 5000 * attempt));
+          }
+        }
 
         const results = response.data?.results || [];
         if (results.length === 0) { hasMore = false; break; }
