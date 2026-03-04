@@ -4822,10 +4822,14 @@ class OrgBookBCScraper {
       let start = 0;
       let hasMore = true;
 
+      const https = require('https');
+      const orgbookAgent = new https.Agent({ rejectUnauthorized: false });
+
       while (hasMore) {
         const response = await axios.get(this.baseUrl, {
           params: { q: '*', inactive: false, latest: true, rows: this.batchSize, start },
           timeout: 30000,
+          httpsAgent: orgbookAgent,
         });
 
         const results = response.data?.results || [];
