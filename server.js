@@ -5011,7 +5011,7 @@ class CanadianImportersLoader {
       const xlsxUrl = 'https://ised-isde.canada.ca/site/canadian-importers-database/sites/default/files/documents/MajorImportersbycity2023.xlsx';
       console.log(`[Importers] Downloading XLSX from: ${xlsxUrl}`);
       const xlsxResp = await axios.get(xlsxUrl, {
-        timeout: 120000,
+        timeout: 300000,
         headers: { 'User-Agent': this.userAgent },
         responseType: 'arraybuffer',
       });
