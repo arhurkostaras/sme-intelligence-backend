@@ -2972,6 +2972,7 @@ class FirmWebsiteEnricher {
     this.delayMs = 3000;
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
     this.running = false;
+    this.smtpAvailable = false;
   }
 
   async enrich(dbClient) {
@@ -2980,6 +2981,10 @@ class FirmWebsiteEnricher {
       return { processed: 0, enriched: 0 };
     }
     this.running = true;
+
+    // Test SMTP port 25 availability
+    this.smtpAvailable = await this._testSmtpPort();
+    console.log(`[CPA Enrichment] SMTP port 25 ${this.smtpAvailable ? 'available' : 'blocked'} — verification ${this.smtpAvailable ? 'enabled' : 'disabled'}`);
 
     // Clean up stale "running" jobs from previous server instances (older than 2 hours)
     try {
@@ -3187,11 +3192,45 @@ class FirmWebsiteEnricher {
       if (hasMx) {
         const patterns = this._generatePatternEmails(cpa.first_name, cpa.last_name, confirmedDomain);
         if (patterns.length > 0) {
-          await dbClient.query(
-            `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1 AND firm_website IS NULL`,
-            [cpa.id, `https://${confirmedDomain}`]
-          );
-          return { email: patterns[0], source: `email_pattern:${confirmedDomain}` };
+          let bestPattern = null;
+          let verified = false;
+          let verificationMethod = 'pattern_unverified';
+
+          if (this.smtpAvailable) {
+            // Detect catch-all: test a random address first
+            const catchAllTest = await this._smtpVerify(`xyzrandom98765@${confirmedDomain}`);
+            if (catchAllTest === 'valid') {
+              // Catch-all domain — SMTP results unreliable, skip pattern verification
+              console.log(`[CPA Enrichment] ${confirmedDomain} is catch-all — skipping SMTP verify for patterns`);
+              bestPattern = patterns[0];
+              verificationMethod = 'pattern_catchall';
+            } else {
+              // Not catch-all — verify each pattern via SMTP
+              for (const candidate of patterns) {
+                const result = await this._smtpVerify(candidate);
+                if (result === 'valid') {
+                  bestPattern = candidate;
+                  verified = true;
+                  verificationMethod = 'smtp_rcpt';
+                  break;
+                } else if (result === 'invalid') {
+                  continue; // Skip invalid patterns
+                }
+                // 'unknown' — stop trying, SMTP inconclusive
+              }
+            }
+          } else {
+            // SMTP blocked — fall back to unverified pattern (existing behavior)
+            bestPattern = patterns[0];
+          }
+
+          if (bestPattern) {
+            await dbClient.query(
+              `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1 AND firm_website IS NULL`,
+              [cpa.id, `https://${confirmedDomain}`]
+            );
+            return { email: bestPattern, source: `email_pattern:${confirmedDomain}` };
+          }
         }
       }
     }
@@ -3327,9 +3366,11 @@ class FirmWebsiteEnricher {
 
             for (const email of foundEmails) {
               if (email.match(/\.(png|jpg|jpeg|gif|svg|css|js|webp|ico|woff|woff2|ttf|eot|map)$/i)) continue;
+              if (email.match(/\d+x\d*\./)) continue; // image dimensions like flags@2x.webp
               if (email.match(/^(example|test|user|email|someone|yourname|your|youremail|your\.?address|your\.?email|your\.?name|name|username|sampleemail)@/i)) continue;
               if (CPA_GENERIC_LOCALS.test(email)) continue;
-              if (email.match(/@(example\.|sentry\.|wixpress\.|mailchimp\.|placeholder\.|test\.|domainmarket\.|email\.com)/i)) continue;
+              if (email.match(/@(mysite|yoursite|yourdomain|domain|website|site|example|sentry|wixpress|mailchimp|placeholder|test|domainmarket|email)\./i)) continue;
+              if (email.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)) continue;
               if (email.split('@')[0].length < 3) continue;
               if (email.match(/^(shop|news|relais|ventas|pomoc|talent|web|people|appsupport|salesfire|newbusiness|notification|partnerships|right\.info|secretariat|secretary|staplestax|taxman|x{2,}|order|leisure|lending|investors|corp|contactus|contact_us|recruitment|reservations|shipping|warehouse|dispatch|returns|booking|socam|rotterdam)@/i)) continue;
               if (email.match(/^u003e/i)) continue;
@@ -3431,11 +3472,16 @@ class FirmWebsiteEnricher {
       await delay(1000);
     }
 
-    // Priority: name-matched email > non-generic email > solo practitioner fallback
+    // Priority: name-matched email > name-matched non-generic email > solo practitioner fallback
     if (nameMatchEmails.length > 0) return { email: nameMatchEmails[0], domainLive: anyPageLoaded };
 
     const nonGeneric = [...allEmails].filter(e => !CPA_GENERIC_LOCALS.test(e));
-    if (nonGeneric.length > 0) return { email: nonGeneric[0], domainLive: anyPageLoaded };
+    const nameMatched = nonGeneric.filter(e => {
+      const local = e.split('@')[0].toLowerCase();
+      return (firstName.length >= 2 && local.includes(firstName)) ||
+             (lastName.length >= 2 && local.includes(lastName));
+    });
+    if (nameMatched.length > 0) return { email: nameMatched[0], domainLive: anyPageLoaded };
 
     // Solo practitioner fallback
     if (this._isSoloPractice(cpa.firm_name, cpa.last_name)) {
@@ -3475,6 +3521,84 @@ class FirmWebsiteEnricher {
   _isSoloPractice(firmName, lastName) {
     if (!firmName || !lastName) return false;
     return firmName.toLowerCase().includes(lastName.toLowerCase());
+  }
+
+  // Verify an email via SMTP RCPT TO
+  async _smtpVerify(email) {
+    if (!this.smtpAvailable) return 'unknown';
+    const domain = email.split('@')[1];
+
+    try {
+      const mxRecords = await Promise.race([
+        dns.resolveMx(domain),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('MX timeout')), DNS_TIMEOUT))
+      ]);
+      if (!mxRecords || mxRecords.length === 0) return 'invalid';
+
+      mxRecords.sort((a, b) => a.priority - b.priority);
+      const mxHost = mxRecords[0].exchange;
+
+      return await new Promise((resolve) => {
+        const socket = new net.Socket();
+        let step = 0;
+        let response = '';
+        const timeout = setTimeout(() => { socket.destroy(); resolve('unknown'); }, 10000);
+
+        socket.connect(25, mxHost, () => {});
+
+        socket.on('data', (data) => {
+          response = data.toString();
+          const code = parseInt(response.substring(0, 3));
+
+          if (step === 0 && code === 220) {
+            socket.write(`EHLO verify.canadaaccountants.app\r\n`);
+            step = 1;
+          } else if (step === 1 && code === 250) {
+            socket.write(`MAIL FROM:<verify@canadaaccountants.app>\r\n`);
+            step = 2;
+          } else if (step === 2 && code === 250) {
+            socket.write(`RCPT TO:<${email}>\r\n`);
+            step = 3;
+          } else if (step === 3) {
+            socket.write('QUIT\r\n');
+            clearTimeout(timeout);
+            if (code === 250) resolve('valid');
+            else if (code === 550 || code === 551 || code === 553) resolve('invalid');
+            else if (code === 252) resolve('valid'); // 252 = cannot verify but will accept
+            else resolve('unknown');
+            socket.destroy();
+          } else {
+            clearTimeout(timeout);
+            socket.write('QUIT\r\n');
+            resolve('unknown');
+            socket.destroy();
+          }
+        });
+
+        socket.on('error', () => { clearTimeout(timeout); resolve('unknown'); });
+        socket.on('timeout', () => { clearTimeout(timeout); socket.destroy(); resolve('unknown'); });
+      });
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  // Test if outbound port 25 is available (Railway may block it)
+  async _testSmtpPort() {
+    try {
+      return await new Promise((resolve) => {
+        const socket = new net.Socket();
+        const timeout = setTimeout(() => { socket.destroy(); resolve(false); }, 5000);
+        // Test against a known MX server (Google)
+        socket.connect(25, 'alt1.gmail-smtp-in.l.google.com', () => {
+          clearTimeout(timeout);
+          socket.write('QUIT\r\n');
+          socket.destroy();
+          resolve(true);
+        });
+        socket.on('error', () => { clearTimeout(timeout); resolve(false); });
+      });
+    } catch { return false; }
   }
 
   async _startJob(dbClient) {
@@ -7572,6 +7696,34 @@ app.get('/api/scrape/status', async (req, res) => {
             `SELECT * FROM scrape_jobs ORDER BY started_at DESC LIMIT 20`
         );
         res.json({ status: 'success', jobs: result.rows });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// GET /api/scrape/stats — aggregated scrape statistics
+app.get('/api/scrape/stats', async (req, res) => {
+    try {
+        const cpaTotals = await dbClient.query(`
+            SELECT source, COUNT(*) as total,
+                COUNT(CASE WHEN email IS NOT NULL OR enriched_email IS NOT NULL THEN 1 END) as with_email,
+                COUNT(CASE WHEN enriched_email IS NOT NULL THEN 1 END) as with_enriched_email,
+                COUNT(CASE WHEN COALESCE(enriched_email, email) IS NOT NULL THEN 1 END) as contactable,
+                COUNT(CASE WHEN firm_name IS NOT NULL AND firm_name != '' THEN 1 END) as with_firm,
+                MIN(scraped_at) as first_scraped, MAX(scraped_at) as last_scraped
+            FROM scraped_cpas GROUP BY source ORDER BY total DESC
+        `);
+        const total = await dbClient.query('SELECT COUNT(*) FROM scraped_cpas');
+        const smeTotals = await dbClient.query('SELECT COUNT(*) as total, COUNT(CASE WHEN contact_email IS NOT NULL THEN 1 END) as with_email FROM scraped_smes');
+        const recentJobs = await dbClient.query('SELECT * FROM scrape_jobs ORDER BY started_at DESC LIMIT 10');
+        res.json({
+            status: 'success',
+            totalScrapedCPAs: parseInt(total.rows[0].count),
+            totalScrapedSMEs: parseInt(smeTotals.rows[0].total),
+            smesWithEmail: parseInt(smeTotals.rows[0].with_email),
+            bySource: cpaTotals.rows,
+            recentJobs: recentJobs.rows,
+        });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message });
     }
