@@ -2970,9 +2970,12 @@ class FirmWebsiteEnricher {
   constructor() {
     this.dailyLimit = 500;
     this.delayMs = 3000;
+    this.batchSize = 5;
     this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
     this.running = false;
     this.smtpAvailable = false;
+    this.dnsCache = new Map();
+    this.crawlCache = new Map();
   }
 
   async enrich(dbClient) {
@@ -2981,6 +2984,8 @@ class FirmWebsiteEnricher {
       return { processed: 0, enriched: 0 };
     }
     this.running = true;
+    this.dnsCache.clear();
+    this.crawlCache.clear();
 
     // Test SMTP port 25 availability
     this.smtpAvailable = await this._testSmtpPort();
@@ -3020,37 +3025,20 @@ class FirmWebsiteEnricher {
 
       console.log(`[Enrichment] Found ${cpasWithFirm.rows.length} CPAs with firm names to enrich`);
 
-      for (const cpa of cpasWithFirm.rows) {
-        totalProcessed++;
-        try {
-          const result = await this._findEmailForCPA(cpa, dbClient);
-          if (result) {
-            // Dedup: skip if this email is already assigned to 2+ other professionals
-            const dupeCheck = await dbClient.query(
-              `SELECT COUNT(*) as c FROM scraped_cpas WHERE enriched_email = $1`, [result.email]
-            );
-            if (parseInt(dupeCheck.rows[0].c) >= 2) {
-              console.log(`[Enrichment] Skipping duplicate email ${result.email} (already assigned to ${dupeCheck.rows[0].c} records)`);
-              await dbClient.query(
-                `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`, [cpa.id]
-              );
-            } else {
-              await dbClient.query(
-                `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
-                [cpa.id, result.email, result.source]
-              );
-              totalEnriched++;
-            }
-          } else {
-            // Mark as attempted so we don't keep retrying
-            await dbClient.query(
-              `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
-              [cpa.id]
-            );
+      // Process in mini-batches of 5
+      for (let i = 0; i < cpasWithFirm.rows.length; i += this.batchSize) {
+        const batch = cpasWithFirm.rows.slice(i, i + this.batchSize);
+        const results = await Promise.allSettled(
+          batch.map(cpa => this._processSingleCPA(cpa, dbClient))
+        );
+
+        for (let j = 0; j < results.length; j++) {
+          totalProcessed++;
+          if (results[j].status === 'fulfilled' && results[j].value) {
+            totalEnriched++;
           }
-        } catch (err) {
-          console.error(`[Enrichment] Error for CPA ${cpa.id}:`, err.message);
         }
+
         if (totalProcessed % 20 === 0) {
           console.log(`[Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
         }
@@ -3073,38 +3061,20 @@ class FirmWebsiteEnricher {
 
         console.log(`[Enrichment] Found ${cpasNoFirm.rows.length} CPAs without firm names to try`);
 
-        for (const cpa of cpasNoFirm.rows) {
-          totalProcessed++;
-          try {
-            // Try Apollo first for no-firm CPAs
-            let result = await this._apolloLookup(cpa, dbClient);
-            if (!result) result = await this._findEmailNoFirm(cpa);
-            if (result) {
-              // Dedup: skip if this email is already assigned to 2+ other professionals
-              const dupeCheck = await dbClient.query(
-                `SELECT COUNT(*) as c FROM scraped_cpas WHERE enriched_email = $1`, [result.email]
-              );
-              if (parseInt(dupeCheck.rows[0].c) >= 2) {
-                console.log(`[Enrichment] Skipping duplicate email ${result.email} (already assigned to ${dupeCheck.rows[0].c} records)`);
-                await dbClient.query(
-                  `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`, [cpa.id]
-                );
-              } else {
-                await dbClient.query(
-                  `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, firm_name = COALESCE(NULLIF(firm_name, ''), $4), enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
-                  [cpa.id, result.email, result.source, result.firmName || '']
-                );
-                totalEnriched++;
-              }
-            } else {
-              await dbClient.query(
-                `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
-                [cpa.id]
-              );
+        // Process in mini-batches of 5
+        for (let i = 0; i < cpasNoFirm.rows.length; i += this.batchSize) {
+          const batch = cpasNoFirm.rows.slice(i, i + this.batchSize);
+          const results = await Promise.allSettled(
+            batch.map(cpa => this._processSingleCPANoFirm(cpa, dbClient))
+          );
+
+          for (let j = 0; j < results.length; j++) {
+            totalProcessed++;
+            if (results[j].status === 'fulfilled' && results[j].value) {
+              totalEnriched++;
             }
-          } catch (err) {
-            console.error(`[Enrichment] Error for CPA ${cpa.id} (no-firm):`, err.message);
           }
+
           if (totalProcessed % 20 === 0) {
             console.log(`[Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
           }
@@ -3152,6 +3122,109 @@ class FirmWebsiteEnricher {
       return null;
     } catch (err) {
       console.error(`[Apollo] Lookup failed for ${professional.first_name} ${professional.last_name}:`, err.message);
+      return null;
+    }
+  }
+
+  // Process a single CPA with firm name (used by parallel mini-batch)
+  async _processSingleCPA(cpa, dbClient) {
+    try {
+      const result = await this._findEmailForCPA(cpa, dbClient);
+      if (result) {
+        // Dedup: skip if this email is already assigned to 2+ other professionals
+        const dupeCheck = await dbClient.query(
+          `SELECT COUNT(*) as c FROM scraped_cpas WHERE enriched_email = $1`, [result.email]
+        );
+        if (parseInt(dupeCheck.rows[0].c) >= 2) {
+          console.log(`[Enrichment] Skipping duplicate email ${result.email} (already assigned to ${dupeCheck.rows[0].c} records)`);
+          await dbClient.query(
+            `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`, [cpa.id]
+          );
+          return false;
+        } else {
+          await dbClient.query(
+            `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+            [cpa.id, result.email, result.source]
+          );
+          return true;
+        }
+      } else {
+        await dbClient.query(
+          `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
+          [cpa.id]
+        );
+        return false;
+      }
+    } catch (err) {
+      console.error(`[Enrichment] Error for CPA ${cpa.id}:`, err.message);
+      return false;
+    }
+  }
+
+  // Process a single CPA without firm name (used by parallel mini-batch)
+  async _processSingleCPANoFirm(cpa, dbClient) {
+    try {
+      let result = await this._apolloLookup(cpa, dbClient);
+      if (!result) result = await this._findEmailNoFirm(cpa);
+      if (result) {
+        const dupeCheck = await dbClient.query(
+          `SELECT COUNT(*) as c FROM scraped_cpas WHERE enriched_email = $1`, [result.email]
+        );
+        if (parseInt(dupeCheck.rows[0].c) >= 2) {
+          console.log(`[Enrichment] Skipping duplicate email ${result.email} (already assigned to ${dupeCheck.rows[0].c} records)`);
+          await dbClient.query(
+            `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`, [cpa.id]
+          );
+          return false;
+        } else {
+          await dbClient.query(
+            `UPDATE scraped_cpas SET enriched_email = $2, enrichment_source = $3, firm_name = COALESCE(NULLIF(firm_name, ''), $4), enrichment_date = NOW(), status = 'enriched', updated_at = NOW() WHERE id = $1`,
+            [cpa.id, result.email, result.source, result.firmName || '']
+          );
+          return true;
+        }
+      } else {
+        await dbClient.query(
+          `UPDATE scraped_cpas SET status = 'enrichment_attempted', updated_at = NOW() WHERE id = $1`,
+          [cpa.id]
+        );
+        return false;
+      }
+    } catch (err) {
+      console.error(`[Enrichment] Error for CPA ${cpa.id} (no-firm):`, err.message);
+      return false;
+    }
+  }
+
+  // Cached DNS resolution to avoid repeated lookups for the same domain
+  async _cachedDnsResolve(domain) {
+    if (this.dnsCache.has(domain)) return this.dnsCache.get(domain);
+    try {
+      const result = await Promise.race([
+        dns.resolve4(domain),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DNS timeout')), DNS_TIMEOUT))
+      ]);
+      this.dnsCache.set(domain, result);
+      return result;
+    } catch (err) {
+      this.dnsCache.set(domain, null);
+      return null;
+    }
+  }
+
+  // Cached MX resolution
+  async _cachedMxResolve(domain) {
+    const cacheKey = `mx:${domain}`;
+    if (this.dnsCache.has(cacheKey)) return this.dnsCache.get(cacheKey);
+    try {
+      const result = await Promise.race([
+        dns.resolveMx(domain),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('MX timeout')), DNS_TIMEOUT))
+      ]);
+      this.dnsCache.set(cacheKey, result);
+      return result;
+    } catch (err) {
+      this.dnsCache.set(cacheKey, null);
       return null;
     }
   }
@@ -3414,14 +3487,36 @@ class FirmWebsiteEnricher {
 
   // Scrape a website for email addresses, prioritizing name matches
   async _scrapeWebsiteForEmail(domain, cpa) {
-    // DNS pre-check — skip domains that don't resolve
-    try {
-      await Promise.race([
-        dns.resolve4(domain),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('DNS timeout')), DNS_TIMEOUT))
-      ]);
-    } catch (err) {
+    // DNS pre-check — skip domains that don't resolve (cached)
+    const dnsResult = await this._cachedDnsResolve(domain);
+    if (!dnsResult) {
       return { email: null, domainLive: false };
+    }
+
+    // Check crawl cache — if we already crawled this domain, search cached emails for name match
+    if (this.crawlCache.has(domain)) {
+      const cached = this.crawlCache.get(domain);
+      const firstName = (cpa.first_name || '').toLowerCase();
+      const lastName = (cpa.last_name || '').toLowerCase();
+
+      // Search cached emails for this CPA's name
+      const nameMatched = cached.emails.filter(e => {
+        const localPart = e.toLowerCase().split('@')[0];
+        return (firstName.length >= 2 && localPart.includes(firstName)) ||
+               (lastName.length >= 2 && localPart.includes(lastName));
+      });
+      if (nameMatched.length > 0) return { email: nameMatched[0], domainLive: cached.domainLive };
+
+      // Solo practitioner fallback on cached emails
+      if (this._isSoloPractice(cpa.firm_name, cpa.last_name)) {
+        const anyValid = cached.emails.filter(e =>
+          !e.match(/@(mysite|yoursite|yourdomain|domain|website|site|example|sentry|wixpress|mailchimp|placeholder|test)\./i) &&
+          !e.match(/impallari|fontawesome|bootstrap|wordpress|@sentry-next/i)
+        );
+        if (anyValid.length === 1) return { email: anyValid[0], domainLive: cached.domainLive };
+      }
+
+      return { email: null, domainLive: cached.domainLive };
     }
 
     const pages = [`https://${domain}`, `https://${domain}/contact`, `https://${domain}/team`, `https://${domain}/about`, `https://${domain}/our-team`, `https://${domain}/people`,
@@ -3472,6 +3567,9 @@ class FirmWebsiteEnricher {
       await delay(1000);
     }
 
+    // Cache crawled emails for this domain so other CPAs at the same firm skip re-crawling
+    this.crawlCache.set(domain, { emails: [...allEmails], domainLive: anyPageLoaded });
+
     // Priority: name-matched email > name-matched non-generic email > solo practitioner fallback
     if (nameMatchEmails.length > 0) return { email: nameMatchEmails[0], domainLive: anyPageLoaded };
 
@@ -3510,10 +3608,7 @@ class FirmWebsiteEnricher {
 
   async _domainAcceptsMail(domain) {
     try {
-      const records = await Promise.race([
-        dns.resolveMx(domain),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('MX timeout')), DNS_TIMEOUT))
-      ]);
+      const records = await this._cachedMxResolve(domain);
       return records && records.length > 0;
     } catch { return false; }
   }
@@ -3529,10 +3624,7 @@ class FirmWebsiteEnricher {
     const domain = email.split('@')[1];
 
     try {
-      const mxRecords = await Promise.race([
-        dns.resolveMx(domain),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('MX timeout')), DNS_TIMEOUT))
-      ]);
+      const mxRecords = await this._cachedMxResolve(domain);
       if (!mxRecords || mxRecords.length === 0) return 'invalid';
 
       mxRecords.sort((a, b) => a.priority - b.priority);
