@@ -3520,7 +3520,8 @@ class FirmWebsiteEnricher {
     }
 
     const pages = [`https://${domain}`, `https://${domain}/contact`, `https://${domain}/team`, `https://${domain}/about`, `https://${domain}/our-team`, `https://${domain}/people`,
-                    `https://${domain}/professionals`, `https://${domain}/about-us`, `https://${domain}/meet-the-team`, `https://${domain}/staff`, `https://${domain}/partners`, `https://${domain}/services`];
+                    `https://${domain}/professionals`, `https://${domain}/about-us`, `https://${domain}/meet-the-team`, `https://${domain}/staff`, `https://${domain}/partners`, `https://${domain}/services`,
+                    `https://${domain}/directory`, `https://${domain}/leadership`, `https://${domain}/who-we-are`, `https://${domain}/our-people`, `https://${domain}/our-firm`, `https://${domain}/members`, `https://${domain}/our-practice`, `https://${domain}/associates`];
     const allEmails = new Set();
     const nameMatchEmails = [];
     const firstName = (cpa.first_name || '').toLowerCase();
