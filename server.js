@@ -3005,63 +3005,78 @@ class FirmWebsiteEnricher {
     let totalProcessed = 0, totalEnriched = 0;
 
     try {
-      // Priority 1: CPAs with firm_name (BC provides these)
-      // Use window function to limit max 2 CPAs per firm per batch,
-      // preventing wasted budget on duplicate email collisions
-      const cpasWithFirm = await dbClient.query(
-        `SELECT id, first_name, last_name, full_name, firm_name, city, province
-         FROM (
-           SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(firm_name)) ORDER BY scraped_at ASC) as rn
-           FROM scraped_cpas
-           WHERE firm_name IS NOT NULL AND firm_name != ''
-             AND email IS NULL AND enriched_email IS NULL
-             AND status = 'raw'
-         ) sub
-         WHERE rn <= 2
-         ORDER BY scraped_at ASC
-         LIMIT $1`,
-        [this.dailyLimit]
-      );
+      // Province rotation: cycle through province groups so every province gets enriched
+      const PROVINCE_GROUPS = [
+        { name: 'Ontario', filter: "LOWER(province) IN ('on','ontario')" },
+        { name: 'BC', filter: "LOWER(province) IN ('bc','british columbia')" },
+        { name: 'Alberta', filter: "LOWER(province) IN ('ab','alberta')" },
+        { name: 'Quebec', filter: "LOWER(province) IN ('qc','quebec')" },
+        { name: 'Prairies', filter: "LOWER(province) IN ('mb','manitoba','sk','saskatchewan')" },
+        { name: 'Atlantic', filter: "LOWER(province) IN ('ns','nova scotia','nb','new brunswick','nl','newfoundland','newfoundland and labrador','pe','pei','prince edward island')" },
+      ];
+      const perGroupLimit = Math.ceil(this.dailyLimit / PROVINCE_GROUPS.length);
 
-      console.log(`[Enrichment] Found ${cpasWithFirm.rows.length} CPAs with firm names to enrich`);
+      // Priority 1: CPAs with firm_name — rotate through province groups
+      for (const group of PROVINCE_GROUPS) {
+        const groupLimit = Math.min(perGroupLimit, this.dailyLimit - totalProcessed);
+        if (groupLimit <= 0) break;
 
-      // Process in mini-batches of 5
-      for (let i = 0; i < cpasWithFirm.rows.length; i += this.batchSize) {
-        const batch = cpasWithFirm.rows.slice(i, i + this.batchSize);
-        const results = await Promise.allSettled(
-          batch.map(cpa => this._processSingleCPA(cpa, dbClient))
+        const cpasWithFirm = await dbClient.query(
+          `SELECT id, first_name, last_name, full_name, firm_name, city, province
+           FROM (
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(TRIM(firm_name)) ORDER BY scraped_at ASC) as rn
+             FROM scraped_cpas
+             WHERE firm_name IS NOT NULL AND firm_name != ''
+               AND email IS NULL AND enriched_email IS NULL
+               AND status = 'raw'
+               AND ${group.filter}
+           ) sub
+           WHERE rn <= 2
+           ORDER BY scraped_at ASC
+           LIMIT ${groupLimit}`
         );
 
-        for (let j = 0; j < results.length; j++) {
-          totalProcessed++;
-          if (results[j].status === 'fulfilled' && results[j].value) {
-            totalEnriched++;
-          }
-        }
+        console.log(`[Enrichment] ${group.name}: Found ${cpasWithFirm.rows.length} CPAs with firm names`);
 
-        if (totalProcessed % 20 === 0) {
-          console.log(`[Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
+        for (let i = 0; i < cpasWithFirm.rows.length; i += this.batchSize) {
+          const batch = cpasWithFirm.rows.slice(i, i + this.batchSize);
+          const results = await Promise.allSettled(
+            batch.map(cpa => this._processSingleCPA(cpa, dbClient))
+          );
+
+          for (let j = 0; j < results.length; j++) {
+            totalProcessed++;
+            if (results[j].status === 'fulfilled' && results[j].value) {
+              totalEnriched++;
+            }
+          }
+
+          if (totalProcessed % 20 === 0) {
+            console.log(`[Enrichment] Progress: ${totalProcessed} processed, ${totalEnriched} enriched`);
+          }
+          await delay(this.delayMs);
         }
-        await delay(this.delayMs);
       }
 
-      // Priority 2: CPAs without firm_name — try name-based search on common CPA firm sites
-      const remaining = this.dailyLimit - totalProcessed;
-      if (remaining > 0) {
+      // Priority 2: CPAs without firm_name — rotate through province groups
+      for (const group of PROVINCE_GROUPS) {
+        const remaining = this.dailyLimit - totalProcessed;
+        const groupLimit = Math.min(perGroupLimit, remaining);
+        if (groupLimit <= 0) break;
+
         const cpasNoFirm = await dbClient.query(
           `SELECT id, first_name, last_name, full_name, city, province
            FROM scraped_cpas
            WHERE (firm_name IS NULL OR firm_name = '')
              AND email IS NULL AND enriched_email IS NULL
              AND status = 'raw'
+             AND ${group.filter}
            ORDER BY scraped_at ASC
-           LIMIT $1`,
-          [remaining]
+           LIMIT ${groupLimit}`
         );
 
-        console.log(`[Enrichment] Found ${cpasNoFirm.rows.length} CPAs without firm names to try`);
+        console.log(`[Enrichment] ${group.name}: Found ${cpasNoFirm.rows.length} CPAs without firm names`);
 
-        // Process in mini-batches of 5
         for (let i = 0; i < cpasNoFirm.rows.length; i += this.batchSize) {
           const batch = cpasNoFirm.rows.slice(i, i + this.batchSize);
           const results = await Promise.allSettled(
@@ -3248,6 +3263,12 @@ class FirmWebsiteEnricher {
         const { email, domainLive } = await this._scrapeWebsiteForEmail(domain, cpa);
         if (domainLive && !confirmedDomain) confirmedDomain = domain;
         if (email) {
+          // Validate with ZeroBounce before accepting
+          const zbResult = await this._zerobounceValidate(email, dbClient);
+          if (!zbResult.valid) {
+            console.log(`[CPA Enrichment] ZeroBounce rejected ${email} (status: ${zbResult.status}) — skipping domain ${domain}`);
+            continue;
+          }
           await dbClient.query(
             `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1`,
             [cpa.id, domain]
@@ -3256,55 +3277,6 @@ class FirmWebsiteEnricher {
         }
       } catch (err) {
         continue;
-      }
-    }
-
-    // Pattern generation fallback: domain was live but no email scraped
-    if (confirmedDomain) {
-      const hasMx = await this._domainAcceptsMail(confirmedDomain);
-      if (hasMx) {
-        const patterns = this._generatePatternEmails(cpa.first_name, cpa.last_name, confirmedDomain);
-        if (patterns.length > 0) {
-          let bestPattern = null;
-          let verified = false;
-          let verificationMethod = 'pattern_unverified';
-
-          if (this.smtpAvailable) {
-            // Detect catch-all: test a random address first
-            const catchAllTest = await this._smtpVerify(`xyzrandom98765@${confirmedDomain}`);
-            if (catchAllTest === 'valid') {
-              // Catch-all domain — SMTP results unreliable, skip pattern verification
-              console.log(`[CPA Enrichment] ${confirmedDomain} is catch-all — skipping SMTP verify for patterns`);
-              bestPattern = patterns[0];
-              verificationMethod = 'pattern_catchall';
-            } else {
-              // Not catch-all — verify each pattern via SMTP
-              for (const candidate of patterns) {
-                const result = await this._smtpVerify(candidate);
-                if (result === 'valid') {
-                  bestPattern = candidate;
-                  verified = true;
-                  verificationMethod = 'smtp_rcpt';
-                  break;
-                } else if (result === 'invalid') {
-                  continue; // Skip invalid patterns
-                }
-                // 'unknown' — stop trying, SMTP inconclusive
-              }
-            }
-          } else {
-            // SMTP blocked — fall back to unverified pattern (existing behavior)
-            bestPattern = patterns[0];
-          }
-
-          if (bestPattern) {
-            await dbClient.query(
-              `UPDATE scraped_cpas SET firm_website = $2 WHERE id = $1 AND firm_website IS NULL`,
-              [cpa.id, `https://${confirmedDomain}`]
-            );
-            return { email: bestPattern, source: `email_pattern:${confirmedDomain}` };
-          }
-        }
       }
     }
 
@@ -3617,6 +3589,50 @@ class FirmWebsiteEnricher {
   _isSoloPractice(firmName, lastName) {
     if (!firmName || !lastName) return false;
     return firmName.toLowerCase().includes(lastName.toLowerCase());
+  }
+
+  // Validate an email via ZeroBounce API (with DB cache)
+  async _zerobounceValidate(email, dbClient) {
+    const apiKey = process.env.ZEROBOUNCE_API_KEY;
+    if (!apiKey) return { valid: true, status: 'no_api_key' };
+
+    try {
+      // Check DB cache (30-day TTL)
+      const cached = await dbClient.query(
+        `SELECT status FROM email_validations WHERE email = $1 AND validated_at > NOW() - INTERVAL '30 days'`,
+        [email.toLowerCase()]
+      );
+      if (cached.rows.length > 0) {
+        const status = cached.rows[0].status;
+        const valid = ['valid', 'catch-all', 'unknown'].includes(status);
+        return { valid, status };
+      }
+
+      // Call ZeroBounce API
+      const response = await axios.get('https://api.zerobounce.net/v2/validate', {
+        params: { api_key: apiKey, email: email, ip_address: '' },
+        timeout: 15000,
+      });
+
+      const status = (response.data.status || '').toLowerCase();
+      const subStatus = (response.data.sub_status || '').toLowerCase();
+
+      // Cache result in DB
+      await dbClient.query(
+        `INSERT INTO email_validations (email, status, sub_status, validated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (email) DO UPDATE SET status = $2, sub_status = $3, validated_at = NOW()`,
+        [email.toLowerCase(), status, subStatus]
+      );
+
+      const valid = ['valid', 'catch-all', 'unknown'].includes(status);
+      console.log(`[ZeroBounce] ${email} → status: ${status}, sub_status: ${subStatus}, valid: ${valid}`);
+      return { valid, status };
+    } catch (err) {
+      console.error(`[ZeroBounce] Error validating ${email}:`, err.message);
+      // On error, allow the email through
+      return { valid: true, status: 'error' };
+    }
   }
 
   // Verify an email via SMTP RCPT TO
@@ -7625,18 +7641,36 @@ async function sendEnrichmentDigest(dbClient) {
         ORDER BY cnt DESC
     `);
 
-    // 3. Recent enrichment jobs (last 6 hours)
+    // 3. Recent enrichment jobs (last 6 hours) — exclude per-record apollo noise
     const recentJobs = await dbClient.query(`
         SELECT source, status, records_found, records_inserted, records_skipped,
                started_at, completed_at, error_message
         FROM scrape_jobs
         WHERE started_at >= NOW() - INTERVAL '6 hours'
+          AND source != 'apollo_enrichment'
           AND (source ILIKE '%enrichment%' OR source ILIKE '%email%' OR source ILIKE '%website%'
                OR source ILIKE '%yellowpages%' OR source ILIKE '%411%' OR source ILIKE '%bbb%'
                OR source ILIKE '%chamber%')
         ORDER BY started_at DESC
         LIMIT 20
     `);
+
+    // 3b. Apollo summary (daily credit usage as a single row)
+    const apolloSummary = await dbClient.query(`
+        SELECT COUNT(*) AS lookups, COALESCE(SUM(records_updated), 0) AS credits_used
+        FROM scrape_jobs
+        WHERE source = 'apollo_enrichment' AND started_at::date = CURRENT_DATE
+    `);
+    const apollo = apolloSummary.rows[0];
+    if (parseInt(apollo.lookups) > 0) {
+        recentJobs.rows.unshift({
+            source: 'apollo_enrichment (daily)',
+            status: 'completed',
+            records_found: parseInt(apollo.lookups),
+            records_inserted: parseInt(apollo.credits_used),
+            started_at: new Date()
+        });
+    }
 
     // 4. Compute deltas
     const currentStats = {
@@ -7785,10 +7819,23 @@ cron.schedule('0 0,6,12,18 * * *', async () => {
 // GET /api/scrape/status — recent scrape jobs
 app.get('/api/scrape/status', async (req, res) => {
     try {
-        const result = await dbClient.query(
-            `SELECT * FROM scrape_jobs ORDER BY started_at DESC LIMIT 20`
+        const { source } = req.query;
+        let result;
+        if (source) {
+            result = await dbClient.query(
+                `SELECT * FROM scrape_jobs WHERE source = $1 ORDER BY started_at DESC LIMIT 50`,
+                [source]
+            );
+            return res.json({ status: 'success', jobs: result.rows });
+        }
+        // Show latest job per source (so enrichment isn't buried by per-record apollo jobs)
+        const latestBySource = await dbClient.query(
+            `SELECT DISTINCT ON (source) * FROM scrape_jobs ORDER BY source, started_at DESC`
         );
-        res.json({ status: 'success', jobs: result.rows });
+        const history = await dbClient.query(
+            `SELECT * FROM scrape_jobs WHERE source != 'apollo_enrichment' ORDER BY started_at DESC LIMIT 50`
+        );
+        res.json({ status: 'success', latestBySource: latestBySource.rows, recentJobs: history.rows });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message });
     }
