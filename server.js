@@ -7902,6 +7902,139 @@ app.post('/api/scrape/rescrape/:source', async (req, res) => {
 });
 
 // POST /api/scrape/trigger/:source — manually trigger a scrape (admin only)
+// Apollo People Search — discover NEW CPAs not in the scraped pool by searching
+// Apollo's LinkedIn-derived database. Different from People Match (enriches one
+// known person) — this FINDS new people matching criteria like title/location.
+// Built 2026-04-13 to refill ACC C1's empty queue after directory scrapes
+// hit diminishing returns (~246 new CPAs/week vs 150/day send rate).
+app.post('/api/admin/apollo-people-search', async (req, res) => {
+  try {
+    const apiKey = process.env.APOLLO_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'APOLLO_API_KEY not configured' });
+
+    const {
+      person_titles = ['CPA', 'Chartered Professional Accountant'],
+      person_locations = ['Canada'],
+      per_page = 25,
+      page = 1,
+      organization_locations = [],
+      person_seniorities = [],
+      dry_run = false,
+    } = req.body || {};
+
+    console.log(`[Apollo Search] Searching: titles=${JSON.stringify(person_titles)}, locations=${JSON.stringify(person_locations)}, page=${page}, per_page=${per_page}`);
+
+    // Call Apollo People Search API
+    const searchPayload = {
+      person_titles,
+      person_locations,
+      per_page: Math.min(per_page, 100),
+      page,
+    };
+    if (organization_locations.length > 0) searchPayload.organization_locations = organization_locations;
+    if (person_seniorities.length > 0) searchPayload.person_seniorities = person_seniorities;
+
+    const searchRes = await axios.post('https://api.apollo.io/api/v1/mixed_people/search', searchPayload, {
+      headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' },
+      timeout: 30000,
+    });
+
+    const people = searchRes.data?.people || [];
+    const totalAvailable = searchRes.data?.pagination?.total_entries || 0;
+
+    console.log(`[Apollo Search] Found ${people.length} results (${totalAvailable} total available)`);
+
+    if (dry_run) {
+      return res.json({
+        success: true,
+        dry_run: true,
+        results_returned: people.length,
+        total_available: totalAvailable,
+        sample: people.slice(0, 5).map(p => ({
+          name: `${p.first_name} ${p.last_name}`,
+          email: p.email,
+          title: p.title,
+          organization: p.organization?.name,
+          city: p.city,
+          state: p.state,
+          country: p.country,
+        })),
+      });
+    }
+
+    // Deduplicate against existing scraped_cpas
+    let inserted = 0, skipped = 0, noEmail = 0;
+    for (const p of people) {
+      if (!p.email) { noEmail++; continue; }
+
+      // Check if email already exists
+      const exists = await dbClient.query(
+        `SELECT id FROM scraped_cpas WHERE LOWER(COALESCE(enriched_email, email)) = LOWER($1)`,
+        [p.email]
+      );
+      if (exists.rows.length > 0) { skipped++; continue; }
+
+      // Parse name
+      const firstName = p.first_name || '';
+      const lastName = p.last_name || '';
+      const fullName = `${lastName}, ${firstName}`.trim().replace(/^,\s*/, '');
+      const firmName = p.organization?.name || '';
+      const city = p.city || '';
+      const province = _mapStateToProvince(p.state || '');
+      const designation = _extractDesignation(p.title || '');
+
+      await dbClient.query(
+        `INSERT INTO scraped_cpas
+         (first_name, last_name, full_name, firm_name, city, province, designation, enriched_email, enrichment_source, status, scraped_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'apollo_search', 'raw', NOW())`,
+        [firstName, lastName, fullName, firmName, city, province, designation, p.email]
+      );
+      inserted++;
+    }
+
+    console.log(`[Apollo Search] Inserted ${inserted}, skipped ${skipped} (already exist), ${noEmail} no email`);
+
+    res.json({
+      success: true,
+      dry_run: false,
+      results_returned: people.length,
+      total_available: totalAvailable,
+      inserted,
+      skipped_existing: skipped,
+      no_email: noEmail,
+      page,
+      per_page: Math.min(per_page, 100),
+    });
+  } catch (err) {
+    console.error('[Apollo Search] Error:', err.response?.data || err.message);
+    res.status(500).json({ error: err.message, details: err.response?.data });
+  }
+});
+
+// Helper: map Canadian state/province names to 2-letter codes
+function _mapStateToProvince(state) {
+  const map = {
+    'ontario': 'ON', 'on': 'ON', 'quebec': 'QC', 'qc': 'QC', 'british columbia': 'BC', 'bc': 'BC',
+    'alberta': 'AB', 'ab': 'AB', 'manitoba': 'MB', 'mb': 'MB', 'saskatchewan': 'SK', 'sk': 'SK',
+    'nova scotia': 'NS', 'ns': 'NS', 'new brunswick': 'NB', 'nb': 'NB',
+    'newfoundland and labrador': 'NL', 'newfoundland': 'NL', 'nl': 'NL',
+    'prince edward island': 'PE', 'pei': 'PE', 'pe': 'PE',
+    'northwest territories': 'NT', 'nt': 'NT', 'nunavut': 'NU', 'nu': 'NU', 'yukon': 'YT', 'yt': 'YT',
+  };
+  return map[(state || '').toLowerCase()] || state || '';
+}
+
+// Helper: extract CPA designation from title string
+function _extractDesignation(title) {
+  if (/CPA,?\s*CA\b/i.test(title)) return 'CPA, CA';
+  if (/CPA,?\s*CMA\b/i.test(title)) return 'CPA, CMA';
+  if (/CPA,?\s*CGA\b/i.test(title)) return 'CPA, CGA';
+  if (/CPA,?\s*CF\b/i.test(title)) return 'CPA, CF';
+  if (/\bCPA\b/i.test(title)) return 'CPA';
+  if (/\bCA\b/i.test(title)) return 'CA';
+  return '';
+}
+
 app.post('/api/scrape/trigger/:source', async (req, res) => {
     const { source } = req.params;
     const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl',
