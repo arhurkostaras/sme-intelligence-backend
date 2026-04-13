@@ -7934,7 +7934,7 @@ app.post('/api/admin/apollo-people-search', async (req, res) => {
     if (organization_locations.length > 0) searchPayload.organization_locations = organization_locations;
     if (person_seniorities.length > 0) searchPayload.person_seniorities = person_seniorities;
 
-    const searchRes = await axios.post('https://api.apollo.io/api/v1/mixed_people/search', searchPayload, {
+    const searchRes = await axios.post('https://api.apollo.io/api/v1/mixed_people/api_search', searchPayload, {
       headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' },
       timeout: 30000,
     });
