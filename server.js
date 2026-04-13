@@ -7939,10 +7939,35 @@ app.post('/api/admin/apollo-people-search', async (req, res) => {
       timeout: 30000,
     });
 
-    const people = searchRes.data?.people || [];
+    const rawPeople = searchRes.data?.people || [];
     const totalAvailable = searchRes.data?.pagination?.total_entries || 0;
 
-    console.log(`[Apollo Search] Found ${people.length} results (${totalAvailable} total available)`);
+    console.log(`[Apollo Search] Found ${rawPeople.length} results (${totalAvailable} total available)`);
+
+    // Step 2: Reveal each person to get full name + email (1 Apollo credit per reveal)
+    const people = [];
+    for (const raw of rawPeople) {
+      if (!raw.id) continue;
+      try {
+        const revealRes = await axios.post('https://api.apollo.io/api/v1/people/match', {
+          id: raw.id,
+          reveal_personal_emails: true,
+        }, {
+          headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' },
+          timeout: 10000,
+        });
+        const person = revealRes.data?.person || {};
+        people.push({
+          ...person,
+          organization: person.organization || raw.organization,
+        });
+        // Rate limit: 200ms between reveals
+        await new Promise(r => setTimeout(r, 200));
+      } catch (err) {
+        console.error(`[Apollo Search] Reveal failed for ${raw.id}:`, err.message);
+      }
+    }
+    console.log(`[Apollo Search] Revealed ${people.length} of ${rawPeople.length} results`);
 
     if (dry_run) {
       return res.json({
