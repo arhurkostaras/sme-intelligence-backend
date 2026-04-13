@@ -7951,14 +7951,19 @@ app.post('/api/admin/apollo-people-search', async (req, res) => {
         results_returned: people.length,
         total_available: totalAvailable,
         sample: people.slice(0, 5).map(p => ({
-          name: `${p.first_name} ${p.last_name}`,
-          email: p.email,
+          name: `${p.first_name || ''} ${p.last_name || ''}`.trim(),
+          email: p.email || null,
           title: p.title,
-          organization: p.organization?.name,
+          organization: p.organization?.name || p.organization_name,
           city: p.city,
           state: p.state,
           country: p.country,
         })),
+        raw_first_result: people.length > 0 ? Object.keys(people[0]).reduce((obj, k) => {
+          const v = people[0][k];
+          obj[k] = typeof v === 'object' ? JSON.stringify(v)?.substring(0, 100) : v;
+          return obj;
+        }, {}) : null,
       });
     }
 
