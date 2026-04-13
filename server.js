@@ -8015,8 +8015,8 @@ app.post('/api/admin/apollo-people-search', async (req, res) => {
 
       await dbClient.query(
         `INSERT INTO scraped_cpas
-         (first_name, last_name, full_name, firm_name, city, province, designation, enriched_email, enrichment_source, status, scraped_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'apollo_search', 'raw', NOW())`,
+         (first_name, last_name, full_name, firm_name, city, province, designation, enriched_email, enrichment_source, source, status, scraped_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'apollo_search', 'apollo_people_search', 'raw', NOW())`,
         [firstName, lastName, fullName, firmName, city, province, designation, p.email]
       );
       inserted++;
