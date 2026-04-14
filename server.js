@@ -7812,22 +7812,44 @@ cron.schedule('0 0,6,12,18 * * *', async () => {
     try { await sendEnrichmentDigest(dbClient); } catch (e) { console.error('[Digest] Failed:', e.message); }
 });
 
-// 🔍 DAILY APOLLO PEOPLE SEARCH — 7 AM ET Mon-Fri
-// Discovers ~68 new CPAs per day via Apollo's LinkedIn-derived database.
+// 🔍 DAILY APOLLO CPA PEOPLE SEARCH — 7 AM ET Mon-Fri
+// Discovers new CPAs via Apollo's LinkedIn-derived database.
 // Runs before the 9 AM send window so fresh contacts are queued and ready.
-// Built 2026-04-14 to sustain ACC C1's send pipeline.
+// Updated 2026-04-14: increased from 4 to 8 pages (200 reveals/day),
+// added seniority targeting + rotation through title cohorts.
+// LAW People Search paused (stale emails) — Apollo budget redirected here.
 const axios_search = require('axios');
+
+// Rotate through title cohorts daily to avoid Apollo returning the same results.
+// Each day picks a different set of titles from the pool.
+const CPA_TITLE_COHORTS = [
+    // Mon: core CPA titles
+    ['CPA', 'Chartered Professional Accountant', 'CPA, CA', 'CPA, CGA', 'CPA, CMA'],
+    // Tue: firm leadership
+    ['Tax Partner', 'Audit Partner', 'Managing Partner CPA', 'Accounting Partner'],
+    // Wed: specialized roles
+    ['Tax Manager', 'Audit Manager', 'Controller', 'CFO'],
+    // Thu: advisory
+    ['Financial Advisor CPA', 'Business Advisory', 'Tax Director', 'Assurance Partner'],
+    // Fri: broader net
+    ['Accountant', 'Tax Specialist', 'Public Accountant', 'CPA Auditor'],
+];
+
 cron.schedule('0 7 * * 1-5', async () => {
-    console.log('[Apollo Search Cron] Starting daily CPA People Search (4 pages × 25)...');
+    const dayOfWeek = new Date().getDay(); // 1=Mon ... 5=Fri
+    const cohortIdx = Math.max(0, dayOfWeek - 1); // 0-4
+    const titles = CPA_TITLE_COHORTS[cohortIdx] || CPA_TITLE_COHORTS[0];
+    console.log(`[Apollo Search Cron] Starting daily CPA People Search (8 pages × 25, cohort=${cohortIdx}: ${titles.join(', ')})...`);
     try {
         const apiKey = process.env.APOLLO_API_KEY;
         if (!apiKey) { console.log('[Apollo Search Cron] No API key, skipping'); return; }
         let totalInserted = 0;
-        for (let page = 1; page <= 4; page++) {
+        for (let page = 1; page <= 8; page++) {
             try {
                 const searchRes = await axios_search.post('https://api.apollo.io/api/v1/mixed_people/api_search', {
-                    person_titles: ['CPA', 'Chartered Professional Accountant', 'CPA, CA', 'CPA, CGA', 'CPA, CMA'],
+                    person_titles: titles,
                     person_locations: ['Canada'],
+                    person_seniorities: ['owner', 'partner', 'c_suite', 'vp', 'director', 'manager'],
                     per_page: 25,
                     page,
                 }, { headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' }, timeout: 30000 });
@@ -7858,11 +7880,11 @@ cron.schedule('0 7 * * 1-5', async () => {
                 }
             } catch (e) { console.error(`[Apollo Search Cron] Page ${page} error:`, e.message); }
         }
-        console.log(`[Apollo Search Cron] Complete: ${totalInserted} new CPAs inserted`);
+        console.log(`[Apollo Search Cron] Complete: ${totalInserted} new CPAs inserted (cohort=${cohortIdx})`);
     } catch (e) { console.error('[Apollo Search Cron] Fatal:', e.message); }
 }, { timezone: 'America/Toronto' });
 
-console.log('[Apollo Search Cron] Scheduled: 7 AM ET Mon-Fri (CPA People Search, 100 reveals/day)');
+console.log('[Apollo Search Cron] Scheduled: 7 AM ET Mon-Fri (CPA People Search, 200 reveals/day, 5 title cohorts)');
 
 // =====================================================
 // 🕷️ SCRAPER API ENDPOINTS
