@@ -7812,6 +7812,58 @@ cron.schedule('0 0,6,12,18 * * *', async () => {
     try { await sendEnrichmentDigest(dbClient); } catch (e) { console.error('[Digest] Failed:', e.message); }
 });
 
+// 🔍 DAILY APOLLO PEOPLE SEARCH — 7 AM ET Mon-Fri
+// Discovers ~68 new CPAs per day via Apollo's LinkedIn-derived database.
+// Runs before the 9 AM send window so fresh contacts are queued and ready.
+// Built 2026-04-14 to sustain ACC C1's send pipeline.
+const axios_search = require('axios');
+cron.schedule('0 7 * * 1-5', async () => {
+    console.log('[Apollo Search Cron] Starting daily CPA People Search (4 pages × 25)...');
+    try {
+        const apiKey = process.env.APOLLO_API_KEY;
+        if (!apiKey) { console.log('[Apollo Search Cron] No API key, skipping'); return; }
+        let totalInserted = 0;
+        for (let page = 1; page <= 4; page++) {
+            try {
+                const searchRes = await axios_search.post('https://api.apollo.io/api/v1/mixed_people/api_search', {
+                    person_titles: ['CPA', 'Chartered Professional Accountant', 'CPA, CA', 'CPA, CGA', 'CPA, CMA'],
+                    person_locations: ['Canada'],
+                    per_page: 25,
+                    page,
+                }, { headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' }, timeout: 30000 });
+                const rawPeople = searchRes.data?.people || [];
+                for (const raw of rawPeople) {
+                    if (!raw.id) continue;
+                    try {
+                        const revealRes = await axios_search.post('https://api.apollo.io/api/v1/people/match', {
+                            id: raw.id, reveal_personal_emails: true,
+                        }, { headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json' }, timeout: 10000 });
+                        const p = revealRes.data?.person || {};
+                        if (!p.email) continue;
+                        const exists = await dbClient.query(
+                            `SELECT id FROM scraped_cpas WHERE LOWER(COALESCE(enriched_email, email)) = LOWER($1)`, [p.email]
+                        );
+                        if (exists.rows.length > 0) continue;
+                        const province = _mapStateToProvince(p.state || '');
+                        const designation = _extractDesignation(p.title || '');
+                        await dbClient.query(
+                            `INSERT INTO scraped_cpas (first_name, last_name, full_name, firm_name, city, province, designation, enriched_email, enrichment_source, source, status, scraped_at)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'apollo_search', 'apollo_people_search', 'raw', NOW())`,
+                            [p.first_name || '', p.last_name || '', `${p.last_name || ''}, ${p.first_name || ''}`.trim().replace(/^,\s*/, ''),
+                             p.organization?.name || '', p.city || '', province, designation, p.email]
+                        );
+                        totalInserted++;
+                        await new Promise(r => setTimeout(r, 200));
+                    } catch (e) { /* skip individual reveal errors */ }
+                }
+            } catch (e) { console.error(`[Apollo Search Cron] Page ${page} error:`, e.message); }
+        }
+        console.log(`[Apollo Search Cron] Complete: ${totalInserted} new CPAs inserted`);
+    } catch (e) { console.error('[Apollo Search Cron] Fatal:', e.message); }
+}, { timezone: 'America/Toronto' });
+
+console.log('[Apollo Search Cron] Scheduled: 7 AM ET Mon-Fri (CPA People Search, 100 reveals/day)');
+
 // =====================================================
 // 🕷️ SCRAPER API ENDPOINTS
 // =====================================================
