@@ -7808,8 +7808,25 @@ async function sendEnrichmentDigest(dbClient) {
 }
 
 // 📊 ENRICHMENT DIGEST — Every 6 hours
+// The digest gets its own short-lived connection: the shared dbClient is a single
+// pg Client whose query queue serializes behind long-running scraper jobs, and a
+// wedged job starves the digest forever with no error (dead reports Jul 18-22).
+// statement_timeout bounds each digest query so a hung query surfaces as a logged
+// failure instead of silence.
 cron.schedule('0 0,6,12,18 * * *', async () => {
-    try { await sendEnrichmentDigest(dbClient); } catch (e) { console.error('[Digest] Failed:', e.message); }
+    const digestClient = new Client({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        statement_timeout: 120000
+    });
+    try {
+        await digestClient.connect();
+        await sendEnrichmentDigest(digestClient);
+    } catch (e) {
+        console.error('[Digest] Failed:', e.message);
+    } finally {
+        await digestClient.end().catch(() => {}); // non-critical: connection teardown only
+    }
 });
 
 // 🔍 DAILY APOLLO CPA PEOPLE SEARCH — 7 AM ET Mon-Fri
