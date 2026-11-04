@@ -3852,10 +3852,13 @@ class SMEEmailEnricher {
       } else if (result && result.website) {
         // Website found but no email — still valuable, save it
         await dbClient.query(
-          `UPDATE scraped_smes SET website = $2, website_source = $3, enrichment_phase = 'website_only',
+          // No website IS NULL guard: rows that already had a website must still be marked attempted,
+          // otherwise they stay 'raw' and the same top 2,000 are re-selected every run.
+          `UPDATE scraped_smes SET website = COALESCE(website, $2), website_source = COALESCE(website_source, $3),
+           enrichment_phase = 'website_only',
            enrichment_attempts = COALESCE(enrichment_attempts, 0) + 1, updated_at = NOW(),
            status = CASE WHEN status IN ('raw', 'active') THEN 'enrichment_attempted' ELSE status END
-           WHERE id = $1 AND website IS NULL`,
+           WHERE id = $1`,
           [sme.id, result.website, result.websiteSource || 'domain_guess']
         );
         return { email: false, websiteFound: true };
@@ -4620,6 +4623,11 @@ class BBBProfileEnricher {
   }
 
   async enrich(dbClient) {
+    // Paused 2026-11-04: BBB profile pages return 403 and the lookup catch retired every match as bbb_no_match.
+    if (process.env.WEBSITE_DISCOVERY_ENABLED !== 'true') {
+      console.log('[BBB] Website discovery disabled (WEBSITE_DISCOVERY_ENABLED is not true), skipping');
+      return { processed: 0, found: 0, disabled: true };
+    }
     if (this.running) {
       console.log('[BBB] Already running, skipping');
       return { processed: 0, found: 0 };
