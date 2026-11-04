@@ -7679,12 +7679,12 @@ async function sendEnrichmentDigest(dbClient) {
         ORDER BY cnt DESC
     `);
 
-    // 3. Recent enrichment jobs (last 6 hours) — exclude per-record apollo noise
+    // 3. Recent enrichment jobs (last 24 hours) — exclude per-record apollo noise
     const recentJobs = await dbClient.query(`
         SELECT source, status, records_found, records_inserted, records_skipped,
                started_at, completed_at, error_message
         FROM scrape_jobs
-        WHERE started_at >= NOW() - INTERVAL '6 hours'
+        WHERE started_at >= NOW() - INTERVAL '24 hours'
           AND source != 'apollo_enrichment'
           AND (source ILIKE '%enrichment%' OR source ILIKE '%email%' OR source ILIKE '%website%'
                OR source ILIKE '%yellowpages%' OR source ILIKE '%411%' OR source ILIKE '%bbb%'
@@ -7764,7 +7764,7 @@ async function sendEnrichmentDigest(dbClient) {
                 </tr>
             `;
         }).join('')
-        : '<tr><td colspan="5" style="padding:12px;text-align:center;color:#888;">No enrichment jobs in the last 6 hours</td></tr>';
+        : '<tr><td colspan="5" style="padding:12px;text-align:center;color:#888;">No enrichment jobs in the last 24 hours</td></tr>';
 
     const html = `
     <div style="max-width:640px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#1a1a1a;">
@@ -7801,7 +7801,7 @@ async function sendEnrichmentDigest(dbClient) {
         </div>
 
         <div style="background:#fff;padding:24px 32px;border:1px solid #e5e7eb;border-top:none;">
-            <h3 style="margin:0 0 12px;font-size:14px;color:#333;">Recent Jobs (Last 6h)</h3>
+            <h3 style="margin:0 0 12px;font-size:14px;color:#333;">Recent Jobs (Last 24h)</h3>
             <table style="width:100%;border-collapse:collapse;font-size:13px;">
                 <thead>
                     <tr style="background:#f9fafb;">
@@ -7830,7 +7830,7 @@ async function sendEnrichmentDigest(dbClient) {
         </div>
 
         <p style="text-align:center;font-size:11px;color:#999;margin-top:16px;">
-            Automated report from sme-intelligence-backend &middot; Next report in 6 hours
+            Automated report from sme-intelligence-backend &middot; Next report in 24 hours
         </p>
     </div>
     `;
@@ -7845,13 +7845,13 @@ async function sendEnrichmentDigest(dbClient) {
     return result;
 }
 
-// 📊 ENRICHMENT DIGEST — Every 6 hours
+// 📊 ENRICHMENT DIGEST — Daily at 12:00 UTC (was every 6 hours; four identical reports a day were noise)
 // The digest gets its own short-lived connection: the shared dbClient is a single
 // pg Client whose query queue serializes behind long-running scraper jobs, and a
 // wedged job starves the digest forever with no error (dead reports Jul 18-22).
 // statement_timeout bounds each digest query so a hung query surfaces as a logged
 // failure instead of silence.
-cron.schedule('0 0,6,12,18 * * *', async () => {
+cron.schedule('0 12 * * *', async () => {
     const digestClient = new Client({
         connectionString: process.env.DATABASE_URL,
         ssl: { rejectUnauthorized: false },
@@ -7999,7 +7999,19 @@ app.get('/api/scrape/stats', async (req, res) => {
 });
 
 // POST /api/scrape/rescrape/:source — clear existing data and re-scrape (admin only)
-app.post('/api/scrape/rescrape/:source', async (req, res) => {
+// Shared-secret gate for operator-only routes (same secret the internal prospects API uses).
+// Fails closed: if INTERNAL_API_SECRET is unset, every request is refused.
+function requireInternalSecret(req, res, next) {
+    const expectedSecret = process.env.INTERNAL_API_SECRET;
+    const authHeader = req.headers.authorization || '';
+    if (!expectedSecret || authHeader !== `Bearer ${expectedSecret}`) {
+        console.warn(`[Auth] Refused ${req.method} ${req.path} from ${req.ip}`);
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+
+app.post('/api/scrape/rescrape/:source', requireInternalSecret, async (req, res) => {
     const { source } = req.params;
     const cpaSources = ['cpabc', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl', 'cpaalberta'];
     if (!cpaSources.includes(source) && source !== 'all_cpas') {
@@ -8036,7 +8048,7 @@ app.post('/api/scrape/rescrape/:source', async (req, res) => {
 // known person) — this FINDS new people matching criteria like title/location.
 // Built 2026-04-13 to refill ACC C1's empty queue after directory scrapes
 // hit diminishing returns (~246 new CPAs/week vs 150/day send rate).
-app.post('/api/admin/apollo-people-search', async (req, res) => {
+app.post('/api/admin/apollo-people-search', requireInternalSecret, async (req, res) => {
   try {
     const apiKey = process.env.APOLLO_API_KEY;
     if (!apiKey) return res.status(500).json({ error: 'APOLLO_API_KEY not configured' });
@@ -8194,7 +8206,7 @@ function _extractDesignation(title) {
   return '';
 }
 
-app.post('/api/scrape/trigger/:source', async (req, res) => {
+app.post('/api/scrape/trigger/:source', requireInternalSecret, async (req, res) => {
     const { source } = req.params;
     const validSources = ['cpabc', 'cpaquebec', 'cpaontario', 'cpaalberta', 'cpamb', 'cpask', 'cpans', 'cpanb', 'cpapei', 'cpanl',
         'corporations_canada', 'statcan_odbus', 'email_enrichment', 'sme_email_enrichment', 'all_cpas',
