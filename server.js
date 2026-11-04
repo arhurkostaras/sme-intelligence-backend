@@ -6972,7 +6972,7 @@ app.get('/api/questionnaire/retrieve/:sessionId', async (req, res) => {
 });
 
 // AI-powered CPA matching endpoint
-app.post('/api/cpa/find-matches', async (req, res) => {
+app.post('/api/cpa/find-matches', requireInternalSecret, async (req, res) => {
     try {
         const { client_preferences, limit = 10 } = req.body;
 
@@ -7086,7 +7086,7 @@ app.get('/api/matches/analytics/:client_id', async (req, res) => {
 });
 
 // 🔐 CPA VERIFICATION ENDPOINT FOR TESTING
-app.post('/api/cpa/verify/:cpa_id', async (req, res) => {
+app.post('/api/cpa/verify/:cpa_id', requireInternalSecret, async (req, res) => {
     try {
         const { cpa_id } = req.params;
         
@@ -7128,7 +7128,7 @@ app.post('/api/cpa/verify/:cpa_id', async (req, res) => {
 });
 
 // 🧪 TEMPORARY TEST ENDPOINT - AI MATCHING WITH MOCK DATA
-app.post('/api/cpa/test-matching', async (req, res) => {
+app.post('/api/cpa/test-matching', requireInternalSecret, async (req, res) => {
     try {
         const { client_preferences, limit = 5 } = req.body;
 
@@ -7282,7 +7282,7 @@ app.get('/api/analytics', async (req, res) => {
 // 🏛️ CPA PROFILE MANAGEMENT APIs
 
 // Register new CPA profile
-app.post('/api/cpa/register', async (req, res) => {
+app.post('/api/cpa/register', requireInternalSecret, async (req, res) => {
     try {
         const {
             first_name, last_name, email, phone, firm_name, firm_size,
