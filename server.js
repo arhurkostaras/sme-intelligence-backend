@@ -4252,11 +4252,18 @@ class YellowPagesWebsiteEnricher {
   constructor() {
     this.batchLimit = 500;
     this.delayMs = 5000;
-    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // Identify the bot honestly; a spoofed browser agent is a bot-evasion pattern we do not use.
+    this.userAgent = 'PhronisiSMEDirectoryBot/1.0';
     this.running = false;
+    this.maxConsecutiveErrors = 10;
   }
 
   async enrich(dbClient) {
+    // Paused 2026-11-04: lookups were failing silently and retiring rows as no-match. Re-enable only after a verified fix.
+    if (process.env.WEBSITE_DISCOVERY_ENABLED !== 'true') {
+      console.log('[YellowPages] Website discovery disabled (WEBSITE_DISCOVERY_ENABLED is not true), skipping');
+      return { processed: 0, found: 0, disabled: true };
+    }
     if (this.running) {
       console.log('[YellowPages] Already running, skipping');
       return { processed: 0, found: 0 };
@@ -4265,7 +4272,7 @@ class YellowPagesWebsiteEnricher {
 
     console.log('🌐 Starting YellowPages website discovery...');
     const jobId = await this._startJob(dbClient);
-    let totalProcessed = 0, totalFound = 0;
+    let totalProcessed = 0, totalFound = 0, consecutiveErrors = 0;
 
     try {
       // Get SMEs without a website, prioritized by score
@@ -4288,6 +4295,17 @@ class YellowPagesWebsiteEnricher {
         totalProcessed++;
         try {
           const result = await this._lookupBusiness(sme);
+          if (result && result.error) {
+            // A failed lookup is not a no-match: leave the row in the queue so it is retried.
+            consecutiveErrors++;
+            console.error(`[YellowPages] Lookup failed for ${sme.business_name}: ${result.error}`);
+            if (consecutiveErrors >= this.maxConsecutiveErrors) {
+              throw new Error(`aborted after ${consecutiveErrors} consecutive lookup failures (last: ${result.error})`);
+            }
+            await delay(this.delayMs);
+            continue;
+          }
+          consecutiveErrors = 0;
           if (result && result.website) {
             await dbClient.query(
               `UPDATE scraped_smes SET website = $2, website_source = 'yellowpages',
@@ -4374,7 +4392,8 @@ class YellowPagesWebsiteEnricher {
 
       return bestMatch;
     } catch (err) {
-      return null;
+      const status = err.response ? `HTTP ${err.response.status}` : err.code || err.message;
+      return { error: status };
     }
   }
 
@@ -4417,11 +4436,18 @@ class Directory411Enricher {
   constructor() {
     this.batchLimit = 500;
     this.delayMs = 5000;
-    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // Identify the bot honestly; a spoofed browser agent is a bot-evasion pattern we do not use.
+    this.userAgent = 'PhronisiSMEDirectoryBot/1.0';
     this.running = false;
+    this.maxConsecutiveErrors = 10;
   }
 
   async enrich(dbClient) {
+    // Paused 2026-11-04: lookups were failing silently and retiring rows as no-match. Re-enable only after a verified fix.
+    if (process.env.WEBSITE_DISCOVERY_ENABLED !== 'true') {
+      console.log('[411.ca] Website discovery disabled (WEBSITE_DISCOVERY_ENABLED is not true), skipping');
+      return { processed: 0, found: 0, disabled: true };
+    }
     if (this.running) {
       console.log('[411.ca] Already running, skipping');
       return { processed: 0, found: 0 };
@@ -4430,7 +4456,7 @@ class Directory411Enricher {
 
     console.log('🌐 Starting 411.ca website discovery...');
     const jobId = await this._startJob(dbClient);
-    let totalProcessed = 0, totalFound = 0;
+    let totalProcessed = 0, totalFound = 0, consecutiveErrors = 0;
 
     try {
       // Get SMEs without a website, skip those already checked by YP
@@ -4453,6 +4479,17 @@ class Directory411Enricher {
         totalProcessed++;
         try {
           const result = await this._lookupBusiness(sme);
+          if (result && result.error) {
+            // A failed lookup is not a no-match: leave the row in the queue so it is retried.
+            consecutiveErrors++;
+            console.error(`[411.ca] Lookup failed for ${sme.business_name}: ${result.error}`);
+            if (consecutiveErrors >= this.maxConsecutiveErrors) {
+              throw new Error(`aborted after ${consecutiveErrors} consecutive lookup failures (last: ${result.error})`);
+            }
+            await delay(this.delayMs);
+            continue;
+          }
+          consecutiveErrors = 0;
           if (result && result.website) {
             await dbClient.query(
               `UPDATE scraped_smes SET website = $2, website_source = '411ca',
@@ -4534,7 +4571,8 @@ class Directory411Enricher {
 
       return bestMatch;
     } catch (err) {
-      return null;
+      const status = err.response ? `HTTP ${err.response.status}` : err.code || err.message;
+      return { error: status };
     }
   }
 
