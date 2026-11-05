@@ -3737,6 +3737,11 @@ class SMEEmailEnricher {
   }
 
   async enrich(dbClient) {
+    // Paused 2026-11-05: guessed domains are mostly the wrong business or parked, so runs took ~8h and found 0 emails.
+    if (process.env.SME_EMAIL_ENRICHMENT_ENABLED !== 'true') {
+      console.log('[SME Enrichment] Disabled (SME_EMAIL_ENRICHMENT_ENABLED is not true), skipping');
+      return { processed: 0, enriched: 0, websitesFound: 0, disabled: true };
+    }
     if (this.running) {
       console.log('[SME Enrichment] Already running, skipping duplicate trigger');
       return { processed: 0, enriched: 0, websitesFound: 0 };
