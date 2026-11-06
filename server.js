@@ -2979,6 +2979,11 @@ class FirmWebsiteEnricher {
   }
 
   async enrich(dbClient) {
+    // Paused 2026-11-06: 17 emails from ~7,500 CPAs over 14 days and none since 2026-11-03.
+    if (process.env.CPA_EMAIL_ENRICHMENT_ENABLED !== 'true') {
+      console.log('[Enrichment] Disabled (CPA_EMAIL_ENRICHMENT_ENABLED is not true), skipping');
+      return { processed: 0, enriched: 0, disabled: true };
+    }
     if (this.running) {
       console.log('[Enrichment] Already running, skipping duplicate trigger');
       return { processed: 0, enriched: 0 };
@@ -7677,7 +7682,7 @@ async function sendEnrichmentDigest(dbClient) {
     const totals = await dbClient.query(`
         SELECT
             COUNT(*) AS total,
-            COUNT(CASE WHEN contact_email IS NOT NULL THEN 1 END) AS with_email,
+            COUNT(CASE WHEN contact_email IS NOT NULL AND status IS DISTINCT FROM 'invalid' THEN 1 END) AS with_email,
             COUNT(CASE WHEN website IS NOT NULL THEN 1 END) AS with_website,
             COUNT(CASE WHEN email_verified = true THEN 1 END) AS verified_emails
         FROM scraped_smes
@@ -7791,7 +7796,7 @@ async function sendEnrichmentDigest(dbClient) {
                 <tr>
                     <td style="padding:12px;text-align:center;width:25%;">
                         <div style="font-size:24px;font-weight:700;color:#667eea;">${currentStats.with_email.toLocaleString()}</div>
-                        <div style="font-size:12px;color:#666;margin-top:2px;">Emails Found</div>
+                        <div style="font-size:12px;color:#666;margin-top:2px;">Usable Emails</div>
                         <div>${deltaStr(deltas?.with_email)}</div>
                     </td>
                     <td style="padding:12px;text-align:center;width:25%;">
@@ -7820,8 +7825,8 @@ async function sendEnrichmentDigest(dbClient) {
                     <tr style="background:#f9fafb;">
                         <th style="padding:8px 12px;text-align:left;font-weight:600;border-bottom:2px solid #e5e7eb;">Source</th>
                         <th style="padding:8px 12px;text-align:left;font-weight:600;border-bottom:2px solid #e5e7eb;">Status</th>
-                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Found</th>
-                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Inserted</th>
+                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Checked</th>
+                        <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Added</th>
                         <th style="padding:8px 12px;text-align:right;font-weight:600;border-bottom:2px solid #e5e7eb;">Time</th>
                     </tr>
                 </thead>
@@ -7850,7 +7855,7 @@ async function sendEnrichmentDigest(dbClient) {
 
     const result = await sendEmail({
         to: ADMIN_EMAIL,
-        subject: `Enrichment Report — ${currentStats.with_email.toLocaleString()} emails (${coverage}% coverage) — ${now}`,
+        subject: `Enrichment Report — ${currentStats.with_email.toLocaleString()} usable emails (${coverage}% coverage) — ${now}`,
         html
     });
 
@@ -8439,7 +8444,7 @@ app.get('/api/scraped-smes/stats', async (req, res) => {
         const result = await dbClient.query(`
             SELECT
                 COUNT(*) AS total,
-                COUNT(CASE WHEN contact_email IS NOT NULL THEN 1 END) AS with_email,
+                COUNT(CASE WHEN contact_email IS NOT NULL AND status IS DISTINCT FROM 'invalid' THEN 1 END) AS with_email,
                 COUNT(CASE WHEN website IS NOT NULL THEN 1 END) AS with_website,
                 COUNT(CASE WHEN email_verified = true THEN 1 END) AS verified_emails,
                 COUNT(CASE WHEN status = 'contacted' THEN 1 END) AS contacted,
